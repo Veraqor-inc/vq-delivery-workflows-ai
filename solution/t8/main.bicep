@@ -15,7 +15,9 @@
 //       executor  the only identity with write roles on back ends; checks the kill switch. Internal.
 //     Images are pulled BY DIGEST with a pull identity whose lifecycle is None (not usable at run time).
 //   - Foundry (AIServices) with one Claude deployment, key sign-in OFF, reached through a private endpoint;
-//   - Key Vault (RBAC, purge protection) holding the approval key (EC P-256, sign/verify, not exportable);
+//   - Key Vault (RBAC, purge protection, private only) holding the approval key (EC P-256, sign/verify, not
+//     exportable). The key is created ONCE, by the owner's two-pass sitting (createApprovalKey, Omar K1-K4); every
+//     other deploy passes the key's versioned ID (approvalKeyId) and never touches the vault's data plane;
 //   - App Configuration (key sign-in off) holding the run switch `agent:enabled` (created by the owner at
 //     landing; a missing flag counts as OFF, so the agent stays off until the owner sets it to exactly "true");
 //   - Storage (shared keys off, blob soft delete and versioning) for the gateway's spend counters;
@@ -129,6 +131,17 @@ param approvalLifetimeHours int = 24
 param conversationCapUsd string = '2'
 param monthlyCapUsd string = '100'
 
+// ---------- The approval key: Omar option A (K1-K4, the eval vault precedent, team/security-review-m13-t8.md) ----------
+// A key is a data-plane object: ARM creates it THROUGH the vault, so with public access Disabled and bypass None the
+// create is refused (ForbiddenByConnection, dwadvisor dev 2026-11-21). The owner's one-time sitting: open the
+// trusted-services bypass (CLI), pass 1 with createApprovalKey=true (key created through ARM with the owner's
+// control-plane rights; no data-plane role for anyone), then pass 2 straight away with createApprovalKey=false and
+// approvalKeyId = pass 1's output, which sets the bypass back to None. Public access stays Disabled throughout.
+@description('Omar K1: true ONLY on the owner command line for pass 1 of the one-time key sitting; never in a committed file and never from the deploy workflow. While true the vault bypass is AzureServices; false (default) keeps it None and leaves the key alone.')
+param createApprovalKey bool = false
+@description('The approval key VERSIONED ID from pass 1 (output approvalKeyId): the vault URI, then keys/approval/<32 hex>. Required whenever createApprovalKey is false. Not a secret.')
+param approvalKeyId string = ''
+
 param vnetPrefix string = '10.70.0.0/24'
 param logDailyCapGb string = '0.2'
 param extraTags object = {}
@@ -173,6 +186,14 @@ var checkedChatUsers = empty(oidProblems) && empty(oidOverlap) ? join(chatUsersL
 
 // Per-person daily spend limit: more than 0 and at most 100 USD (the app refuses anything else at start, too).
 var checkedDailyUsd = json(dailyUsdPerPerson) > 0 && json(dailyUsdPerPerson) <= 100 ? dailyUsdPerPerson : json('dailyUsdPerPerson must be more than 0 and at most 100: ${dailyUsdPerPerson}')
+
+// ---------- The approval key's versioned ID (the apps pin one version: keyvault-signer.ts refuses a versionless ID) ----------
+// The vault name is built here, so the check reads neither the vault nor the key (no data-plane call at all).
+var kvName = 'kv-${take(compact, 21)}'
+var approvalKeyPrefix = 'https://${kvName}${environment().suffixes.keyvaultDns}/keys/approval/'
+var suppliedKeyVersion = startsWith(approvalKeyId, approvalKeyPrefix) ? substring(approvalKeyId, length(approvalKeyPrefix)) : 'x'
+var keyVersionOk = length(suppliedKeyVersion) == 32 && empty(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(suppliedKeyVersion, '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', ''))
+var checkedApprovalKeyId = createApprovalKey ? approvalKey!.properties.keyUriWithVersion : keyVersionOk ? approvalKeyId : json('approvalKeyId must be the approval key of this vault with its version (${approvalKeyPrefix}<32 hex>, output approvalKeyId of the key sitting): ${approvalKeyId}')
 
 var checkedApprovalsAudience = approvalsAudience == agentAudience ? json('approvalsAudience ${approvalsAudience} must be its own app registration, not the agent\'s chat audience') : approvalsAudience
 
@@ -338,7 +359,7 @@ resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-
 
 // ---------- Key Vault and the approval key (sign/verify, not exportable) ----------
 resource kv 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: 'kv-${take(compact, 21)}'
+  name: kvName
   location: location
   tags: tags
   properties: {
@@ -348,11 +369,14 @@ resource kv 'Microsoft.KeyVault/vaults@2023-07-01' = {
     enablePurgeProtection: true
     softDeleteRetentionInDays: 90
     publicNetworkAccess: 'Disabled'
-    networkAcls: { defaultAction: 'Deny', bypass: 'None' }
+    // Omar K1, K2: ONE expression drives the bypass; nothing else about the vault's network ever changes.
+    networkAcls: { defaultAction: 'Deny', bypass: createApprovalKey ? 'AzureServices' : 'None', ipRules: [], virtualNetworkRules: [] }
   }
 }
 
-resource approvalKey 'Microsoft.KeyVault/vaults/keys@2023-07-01' = {
+// Declared only for pass 1 (Omar K1). ARM's create is idempotent (an existing key is returned, no new version), and on
+// every other deploy the key is not in the template at all, so ARM never reads or writes it through the vault.
+resource approvalKey 'Microsoft.KeyVault/vaults/keys@2023-07-01' = if (createApprovalKey) {
   parent: kv
   name: 'approval'
   properties: {
@@ -640,7 +664,7 @@ resource approvalApp 'Microsoft.App/containerApps@2025-07-01' = {
           env: concat(commonEnv, [
             { name: 'ROLE', value: 'approval' }
             { name: 'AZURE_CLIENT_ID', value: approvalId.properties.clientId }
-            { name: 'APPROVAL_KEY_ID', value: approvalKey.properties.keyUriWithVersion }
+            { name: 'APPROVAL_KEY_ID', value: checkedApprovalKeyId }
             { name: 'APPROVAL_LIFETIME_HOURS', value: string(approvalLifetimeHours) }
             { name: 'ENVIRONMENT', value: environmentName }
             { name: 'APPROVALS_AUDIENCE', value: checkedApprovalsAudience }
@@ -720,7 +744,7 @@ resource executorApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'ROLE', value: 'executor' }
             { name: 'AZURE_CLIENT_ID', value: executorId.properties.clientId }
             { name: 'APPROVAL_URL', value: approvalUrl }
-            { name: 'APPROVAL_KEY_ID', value: approvalKey.properties.keyUriWithVersion }
+            { name: 'APPROVAL_KEY_ID', value: checkedApprovalKeyId }
             { name: 'APPROVAL_OID', value: approvalId.properties.principalId }
             { name: 'APP_CONFIG_ENDPOINT', value: appConfig.properties.endpoint }
             { name: 'MAINTENANCE_API_URL', value: maintenanceApiUrl }
@@ -800,7 +824,9 @@ output gatewayFqdn string = gatewayFqdn
 output foundryName string = foundry.name
 output modelDeploymentName string = modelDeployment.name
 output keyVaultName string = kv.name
-output approvalKeyId string = approvalKey.properties.keyUriWithVersion
+output approvalKeyId string = checkedApprovalKeyId
+// Omar K3 read-back: None on every deploy except pass 1 (the deploy workflow refuses anything else).
+output keyVaultBypass string = kv.properties.networkAcls.bypass
 output appConfigName string = appConfig.name
 output appConfigEndpoint string = appConfig.properties.endpoint
 output storageName string = storage.name
