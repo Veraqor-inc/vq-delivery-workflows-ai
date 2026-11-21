@@ -63,10 +63,10 @@ permissions: {}
 # FIXED BY THE PLATFORM (Omar P2A-1): filled in when published; left unfilled, every uat and prod deploy stops at
 # "Check inputs". None is secret.
 env:
-  RELEASE_GATE_URL: __RELEASE_GATE_URL__
-  RELEASE_GATE_AUDIENCE: __RELEASE_GATE_AUDIENCE__
-  RELEASE_STORE_URL: __RELEASE_STORE_URL__
-  RELEASE_STORE_AUDIENCE: __RELEASE_STORE_AUDIENCE__
+  RELEASE_GATE_URL: https://ca-vqbench-engine.agreeablehill-d77b7657.westus3.azurecontainerapps.io/release/gate
+  RELEASE_GATE_AUDIENCE: api://vq-release-gate
+  RELEASE_STORE_URL: https://ca-vqbench-engine.agreeablehill-d77b7657.westus3.azurecontainerapps.io/release/artifact
+  RELEASE_STORE_AUDIENCE: api://vq-release-store
   RELEASE_VERIFIER_URL: ""
   RELEASE_VERIFIER_AUDIENCE: ""
   RELEASE_VERIFIER_REQUIRED: "false"
