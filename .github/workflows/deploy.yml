@@ -1,0 +1,432 @@
+# The ai family's reusable DEPLOY workflow for T8 (M13 3.3 "New: the T8 deploy workflow"; same pattern and rules as
+# the web family's templates/release/deploy.yml). LOCAL TEMPLATE: it is published as .github/workflows/deploy.yml in
+# the ai family's platform repository only after review (nothing is pushed from here). Every call it makes is in
+# templates/catalogue/t8.calls.json; test/t8-deploy-workflow.test.ts checks both ways and refuses forbidden calls.
+#
+# One job per environment. The order is the control, top to bottom:
+#   1. check the inputs and the platform's fixed endpoints (dev and qa only on a push to main; uat and prod only on
+#      the engine's repository_dispatch; main only);
+#   2. check from the job's own OIDC token that this is the platform's deploy.yml at the pinned commit;
+#   3. uat and prod: the ENGINE RELEASE GATE first, before anything touches Azure. For T8 the go must also carry the
+#      green EVAL RECORD of this exact release (image digest + skills hash; M13 3.3.1 item 2 step 5): no record, a
+#      red record or a record for another digest stops the job here. prod then asks the independent verifier;
+#   4. get release.tar (dev and qa: this run's artifact; uat and prod: the release store, by digest);
+#   5. check its digest and attestation (signer = the platform's release.yml at an allowed commit, from main at the
+#      merge commit, GitHub-hosted runner); the images inside must be pinned by digest;
+#   6. check out the platform's T8 template at the pinned commit; 7. sign in to Azure (OIDC, no secret);
+#   8. what-if (no deletes) and deploy main.bicep with the images BY DIGEST (never `az containerapp up/update`) and
+#      the released skills hash (Omar B5: the image is the only source of skills; the agent refuses to start unless
+#      its skills hash to it, so nothing is uploaded); 9. T8-K: index definition as code;
+#  10. smoke test: the agent answers its health route and refuses an unsigned chat call.
+# Omar B3: before any Azure sign-in, the gateway image (it holds the caps and the stop) must be the digest this
+# workflow pins (GATEWAY_IMAGE_DIGEST, fixed in the ai family's platform repository at a reviewed commit).
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev, qa, uat or prod
+        type: string
+        required: true
+      release-run-id:
+        description: The workflow run that built release.tar
+        type: string
+        required: true
+      artifact-digest:
+        description: sha256:<64 hex> of release.tar
+        type: string
+        required: true
+      platform-repository:
+        description: owner/name of the ai family's platform workflow repository
+        type: string
+        required: true
+      platform-sha:
+        description: The full commit SHA of the platform repository this workflow is called at
+        type: string
+        required: true
+      release-id:
+        description: The engine's release ID (uat, prod)
+        type: string
+        default: ""
+      dispatch-id:
+        description: The engine's dispatch ID for this promotion (uat, prod)
+        type: string
+        default: ""
+      rollback:
+        description: Roll back to this release (uat, prod; N-1 only)
+        type: boolean
+        default: false
+
+permissions: {}
+
+# FIXED BY THE PLATFORM (Omar P2A-1): filled in when published; left unfilled, every uat and prod deploy stops at
+# "Check inputs". None is secret.
+env:
+  RELEASE_GATE_URL: __RELEASE_GATE_URL__
+  RELEASE_GATE_AUDIENCE: __RELEASE_GATE_AUDIENCE__
+  RELEASE_STORE_URL: __RELEASE_STORE_URL__
+  RELEASE_STORE_AUDIENCE: __RELEASE_STORE_AUDIENCE__
+  RELEASE_VERIFIER_URL: ""
+  RELEASE_VERIFIER_AUDIENCE: ""
+  RELEASE_VERIFIER_REQUIRED: "false"
+  RELEASE_SIGNER_PREVIOUS_SHAS: ""
+  # Omar B3: the platform gateway image digest every T8 environment must run (sha256:<64 hex>). Changing it is a
+  # reviewed commit of this repository (Omar reads back the diff before the new workflow SHA is set).
+  GATEWAY_IMAGE_DIGEST: sha256:98a8ef10759b2646ca5acabf2e7b4a4429166f4cce9e7c275b09ac21b7f4452e
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      attestations: read
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      RELEASE_RUN_ID: ${{ inputs.release-run-id }}
+      ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+      PLATFORM_REPOSITORY: ${{ inputs.platform-repository }}
+      PLATFORM_SHA: ${{ inputs.platform-sha }}
+      RELEASE_ID: ${{ inputs.release-id }}
+      DISPATCH_ID: ${{ inputs.dispatch-id }}
+      ROLLBACK: ${{ inputs.rollback }}
+      # This environment's identifiers (GitHub environment VARIABLES set by the environment owner; nothing secret).
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      T8_RESOURCE_GROUP: ${{ vars.T8_RESOURCE_GROUP }}
+      T8_SOLUTION: ${{ vars.T8_SOLUTION }}
+      T8_LOCATION: ${{ vars.T8_LOCATION }}
+      T8_IDENTITY_RESOURCE_GROUP: ${{ vars.T8_IDENTITY_RESOURCE_GROUP }}
+      T8_REGISTRY_SERVER: ${{ vars.T8_REGISTRY_SERVER }}
+      T8_GATEWAY_IMAGE: ${{ vars.T8_GATEWAY_IMAGE }}
+      T8_AGENT_AUDIENCE: ${{ vars.T8_AGENT_AUDIENCE }}
+      T8_SERVICE_AUDIENCE: ${{ vars.T8_SERVICE_AUDIENCE }}
+      T8_GATEWAY_AUDIENCE: ${{ vars.T8_GATEWAY_AUDIENCE }}
+      T8_SKILL: ${{ vars.T8_SKILL }}
+      T8_MODEL: ${{ vars.T8_MODEL }}
+      T8_CLAUDE_PROVIDER: ${{ vars.T8_CLAUDE_PROVIDER }}
+      T8_MAINTENANCE_API_URL: ${{ vars.T8_MAINTENANCE_API_URL }}
+      T8_MAINTENANCE_API_SCOPE: ${{ vars.T8_MAINTENANCE_API_SCOPE }}
+      T8_ENABLE_KNOWLEDGE: ${{ vars.T8_ENABLE_KNOWLEDGE }}
+      T8_ENABLE_TEAMS: ${{ vars.T8_ENABLE_TEAMS }}
+      T8_APPROVALS_AUDIENCE: ${{ vars.T8_APPROVALS_AUDIENCE }}
+      # dev and qa only. uat and prod take the approver list from the engine gate's answer (Omar A1(c), B1).
+      T8_APPROVER_OIDS: ${{ vars.T8_APPROVER_OIDS }}
+      T8_VNET_PREFIX: ${{ vars.T8_VNET_PREFIX }}
+      # The advisor's chat users and per-person daily limits (Omar M1, ruling 3.1); main.bicep checks them again.
+      T8_CHAT_USER_OIDS: ${{ vars.T8_CHAT_USER_OIDS }}
+      T8_DAILY_TURNS_PER_PERSON: ${{ vars.T8_DAILY_TURNS_PER_PERSON }}
+      T8_DAILY_USD_PER_PERSON: ${{ vars.T8_DAILY_USD_PER_PERSON }}
+    steps:
+      - name: Check inputs (main only; who may start which environment; the platform's fixed endpoints)
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "deploys run from main only"; exit 1; }
+          [[ "$ENV_NAME" =~ ^(dev|qa|uat|prod)$ ]] || { echo "environment must be dev, qa, uat or prod"; exit 1; }
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]{1,20}$ ]] || { echo "release-run-id must be a run number"; exit 1; }
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "artifact-digest must be sha256:<64 hex>"; exit 1; }
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$ ]] || { echo "platform-repository must be owner/name"; exit 1; }
+          [[ "$PLATFORM_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "platform-sha must be a full commit SHA"; exit 1; }
+          [[ "$ROLLBACK" == "true" || "$ROLLBACK" == "false" ]] || { echo "rollback must be true or false"; exit 1; }
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]{1,6}$ ]] || { echo "no run attempt"; exit 1; }
+          [[ "$RELEASE_VERIFIER_REQUIRED" == "true" || "$RELEASE_VERIFIER_REQUIRED" == "false" ]] || { echo "RELEASE_VERIFIER_REQUIRED must be true or false"; exit 1; }
+          for s in $RELEASE_SIGNER_PREVIOUS_SHAS; do [[ "$s" =~ ^[0-9a-f]{40}$ ]] || { echo "RELEASE_SIGNER_PREVIOUS_SHAS must list full commit SHAs"; exit 1; }; done
+          for a in "$RELEASE_GATE_AUDIENCE" "$RELEASE_STORE_AUDIENCE" "$RELEASE_VERIFIER_AUDIENCE"; do
+            [[ "${a,,}" != *azureadtokenexchange* ]] || { echo "an Azure token-exchange audience is never a gate, store or verifier audience"; exit 1; }
+          done
+          [[ "$T8_SOLUTION" =~ ^[a-z0-9]{3,12}$ ]] || { echo "T8_SOLUTION is not set"; exit 1; }
+          [[ "$T8_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ && "$T8_IDENTITY_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ ]] || { echo "the resource groups are not set"; exit 1; }
+          [[ "$T8_ENABLE_KNOWLEDGE" == "true" || "$T8_ENABLE_KNOWLEDGE" == "false" ]] || { echo "T8_ENABLE_KNOWLEDGE must be true or false"; exit 1; }
+          [[ "$T8_ENABLE_TEAMS" == "true" || "$T8_ENABLE_TEAMS" == "false" ]] || { echo "T8_ENABLE_TEAMS must be true or false"; exit 1; }
+          [[ -z "$T8_DAILY_TURNS_PER_PERSON" || "$T8_DAILY_TURNS_PER_PERSON" =~ ^[0-9]{1,4}$ ]] || { echo "T8_DAILY_TURNS_PER_PERSON must be a whole number"; exit 1; }
+          [[ -z "$T8_DAILY_USD_PER_PERSON" || "$T8_DAILY_USD_PER_PERSON" =~ ^[0-9]{1,3}(\.[0-9]{1,2})?$ ]] || { echo "T8_DAILY_USD_PER_PERSON must be a number of dollars"; exit 1; }
+          https='^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?/[A-Za-z0-9/._-]*$'
+          audience='^[A-Za-z0-9:/._-]{3,200}$'
+          oids='^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$'
+          [[ "$T8_APPROVALS_AUDIENCE" =~ $audience && "${T8_APPROVALS_AUDIENCE,,}" != "${T8_AGENT_AUDIENCE,,}" ]] || { echo "T8_APPROVALS_AUDIENCE must be set and differ from the agent's chat audience"; exit 1; }
+          case "$ENV_NAME" in
+            dev|qa)
+              [[ "$GITHUB_EVENT_NAME" == "push" ]] || { echo "dev and qa deploy only after a push to main"; exit 1; }
+              [[ "$ROLLBACK" == "false" ]] || { echo "dev and qa roll forward; rollback is for uat and prod"; exit 1; }
+              [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "no commit"; exit 1; }
+              { echo "MERGE_COMMIT=$GITHUB_SHA"; echo "SIGNER_SHA=$PLATFORM_SHA"; } >> "$GITHUB_ENV"
+              [[ -z "$T8_APPROVER_OIDS" || "$T8_APPROVER_OIDS" =~ $oids ]] || { echo "T8_APPROVER_OIDS must list object IDs, comma-separated"; exit 1; }
+              echo "APPROVER_OIDS=$T8_APPROVER_OIDS" >> "$GITHUB_ENV"
+              ;;
+            uat|prod)
+              [[ "$GITHUB_EVENT_NAME" == "repository_dispatch" ]] || { echo "uat and prod deploy only on the engine's promotion"; exit 1; }
+              uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              [[ "$RELEASE_ID" =~ $uuid && "$DISPATCH_ID" =~ $uuid ]] || { echo "release-id and dispatch-id must be the engine's IDs"; exit 1; }
+              [[ "$RELEASE_GATE_URL" =~ $https && "$RELEASE_STORE_URL" =~ $https ]] || { echo "the platform's gate and release store addresses are not set"; exit 1; }
+              [[ "$RELEASE_GATE_AUDIENCE" =~ $audience && "$RELEASE_STORE_AUDIENCE" =~ $audience ]] || { echo "the platform's gate and release store audiences are not set"; exit 1; }
+              [[ "$RELEASE_GATE_AUDIENCE" != "$RELEASE_STORE_AUDIENCE" ]] || { echo "the gate and the release store need different audiences"; exit 1; }
+              ;;
+          esac
+          if [[ -n "$RELEASE_VERIFIER_URL" ]]; then
+            [[ "$RELEASE_VERIFIER_URL" =~ $https ]] || { echo "the verifier address is not https"; exit 1; }
+            [[ "$RELEASE_VERIFIER_AUDIENCE" =~ $audience ]] || { echo "the verifier needs its own audience"; exit 1; }
+            [[ "$RELEASE_VERIFIER_AUDIENCE" != "$RELEASE_GATE_AUDIENCE" && "$RELEASE_VERIFIER_AUDIENCE" != "$RELEASE_STORE_AUDIENCE" ]] || { echo "the verifier needs its own audience"; exit 1; }
+          fi
+          echo "Deploying T8 release $ARTIFACT_DIGEST to $ENV_NAME (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check this job runs the platform deploy workflow at the pinned commit
+        run: |
+          set -euo pipefail
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=platform-self-check" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token"; exit 1; }
+          echo "::add-mask::$token"
+          payload="$(cut -d. -f2 <<<"$token" | tr '_-' '/+')"
+          while (( ${#payload} % 4 )); do payload+="="; done
+          claims="$(base64 -d <<<"$payload")"
+          ref="$(jq -r '.job_workflow_ref // ""' <<<"$claims")"; sha="$(jq -r '.job_workflow_sha // ""' <<<"$claims")"
+          [[ "$ref" == "$PLATFORM_REPOSITORY/.github/workflows/deploy.yml@$PLATFORM_SHA" && "$sha" == "$PLATFORM_SHA" ]] || { echo "this job does not run $PLATFORM_REPOSITORY deploy.yml at $PLATFORM_SHA (it runs $ref)"; exit 1; }
+
+      # S12-1 and, for T8, H4: the go also carries this release's EVAL RECORD. UAT and production need a green record
+      # for the exact image digest and skills hash being deployed (checked against the release below). Fails closed.
+      - name: Engine release gate with the release's eval record (uat and prod, before any Azure sign-in)
+        if: inputs.environment == 'uat' || inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_GATE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_GATE_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the gate"; exit 1; }
+          echo "::add-mask::$token"
+          body="$(jq -n --arg releaseId "$RELEASE_ID" --arg dispatchId "$DISPATCH_ID" --arg environment "$ENV_NAME" \
+            --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg artifactDigest "$ARTIFACT_DIGEST" \
+            --argjson rollback "$ROLLBACK" --arg template "T8" \
+            '{releaseId: $releaseId, dispatchId: $dispatchId, environment: $environment, runId: $runId, runAttempt: $runAttempt, artifactDigest: $artifactDigest, rollback: $rollback, template: $template}')"
+          code="$(curl -sS --max-time 30 -o gate.json -w '%{http_code}' -X POST "$RELEASE_GATE_URL" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$body" || echo 000)"
+          decision="$(jq -r '.decision // "none"' gate.json 2>/dev/null || echo none)"
+          reason="$(jq -r '.reason // "no answer"' gate.json 2>/dev/null || echo "no answer")"
+          merge="$(jq -r '.mergeCommit // ""' gate.json 2>/dev/null || true)"
+          signer="$(jq -r '.signerSha // ""' gate.json 2>/dev/null || true)"
+          evalConclusion="$(jq -r '.evalRecord.conclusion // ""' gate.json 2>/dev/null || true)"
+          evalImage="$(jq -r '.evalRecord.imageDigest // ""' gate.json 2>/dev/null || true)"
+          evalSkills="$(jq -r '.evalRecord.skillsHash // ""' gate.json 2>/dev/null || true)"
+          approvers="$(jq -r '(.approverObjectIds // []) | join(",")' gate.json 2>/dev/null || true)"
+          rm -f gate.json
+          if [[ "$code" != "200" || "$decision" != "go" ]]; then
+            echo "Release gate: NO-GO ($code): $reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          [[ "$merge" =~ ^[0-9a-f]{40}$ && "$signer" =~ ^[0-9a-f]{40}$ ]] || { echo "Release gate: the go names no merge commit or signer: refused"; exit 1; }
+          [[ "$evalConclusion" == "success" && "$evalImage" =~ ^sha256:[0-9a-f]{64}$ && "$evalSkills" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Release gate: no green eval record for this release digest: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          # Omar A1(c), B1: the approver list is the engine's recorded list for this solution, never a repository variable.
+          [[ -n "$approvers" ]] || { echo "Release gate: the go names no approver list: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "$approvers" =~ ^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$ ]] || { echo "Release gate: the approver list is not object IDs: refused"; exit 1; }
+          { echo "MERGE_COMMIT=$merge"; echo "SIGNER_SHA=$signer"; echo "EVAL_IMAGE_DIGEST=$evalImage"; echo "EVAL_SKILLS_HASH=$evalSkills"; echo "APPROVER_OIDS=$approvers"; } >> "$GITHUB_ENV"
+          echo "Release gate: GO for $ENV_NAME, digest $ARTIFACT_DIGEST, commit $merge, eval record $evalImage" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Independent production verifier (prod; mandatory once required)
+        if: inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_VERIFIER_URL" ]]; then
+            if [[ "$RELEASE_VERIFIER_REQUIRED" == "true" ]]; then echo "Verifier: NO-GO (production requires the independent verifier and none is configured)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "Verifier: not configured. Production rests on the engine gate alone: allowed only on synthetic data, before P4" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "${RELEASE_VERIFIER_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_VERIFIER_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the verifier"; exit 1; }
+          echo "::add-mask::$token"
+          body="$(jq -n --arg releaseId "$RELEASE_ID" --arg environment "$ENV_NAME" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg artifactDigest "$ARTIFACT_DIGEST" \
+            '{releaseId: $releaseId, environment: $environment, runId: $runId, runAttempt: $runAttempt, artifactDigest: $artifactDigest}')"
+          code="$(curl -sS --max-time 30 -o verifier.json -w '%{http_code}' -X POST "$RELEASE_VERIFIER_URL" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$body" || echo 000)"
+          decision="$(jq -r '.decision // "none"' verifier.json 2>/dev/null || echo none)"
+          rm -f verifier.json
+          [[ "$code" == "200" && "$decision" == "go" ]] || { echo "Verifier: NO-GO ($code)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "Verifier: GO" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Download release.tar from this release run (dev and qa)
+        if: inputs.environment == 'dev' || inputs.environment == 'qa'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+          run-id: ${{ inputs.release-run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Fetch release.tar from the platform release store by digest (uat and prod)
+        if: inputs.environment == 'uat' || inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_STORE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_STORE_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the release store"; exit 1; }
+          echo "::add-mask::$token"
+          mkdir -p release
+          code="$(curl -sS --max-time 300 -o release/release.tar -w '%{http_code}' -H "Authorization: Bearer $token" \
+            "$RELEASE_STORE_URL/${ARTIFACT_DIGEST#sha256:}" || echo 000)"
+          [[ "$code" == "200" ]] || { echo "the release store answered $code for $ARTIFACT_DIGEST"; exit 1; }
+
+      # T8's release carries agent-image.json (both images BY DIGEST and the skills hash), skills.tar and the SBOM.
+      - name: Verify the digest, the signer, the source, the attestation and the images (by digest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum release/release.tar | cut -d' ' -f1)"
+          [[ "$digest" == "$ARTIFACT_DIGEST" ]] || { echo "digest mismatch: expected $ARTIFACT_DIGEST, got $digest"; exit 1; }
+          merge="${MERGE_COMMIT:-}"; signer="${SIGNER_SHA:-}"
+          [[ "$merge" =~ ^[0-9a-f]{40}$ ]] || { echo "no merge commit to verify against"; exit 1; }
+          allowed=" $PLATFORM_SHA $RELEASE_SIGNER_PREVIOUS_SHAS "
+          [[ "$signer" =~ ^[0-9a-f]{40}$ && "$allowed" == *" $signer "* ]] || { echo "release.yml at $signer is not an allowed signer"; exit 1; }
+          gh attestation verify release/release.tar \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$PLATFORM_REPOSITORY/.github/workflows/release.yml" \
+            --signer-digest "$signer" \
+            --source-ref refs/heads/main \
+            --source-digest "$merge" \
+            --deny-self-hosted-runners
+          gh attestation verify release/release.tar \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$PLATFORM_REPOSITORY/.github/workflows/release.yml" \
+            --signer-digest "$signer" \
+            --source-ref refs/heads/main \
+            --source-digest "$merge" \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            --deny-self-hosted-runners > /dev/null
+          bad="$(tar -tvf release/release.tar | cut -c1 | grep -v '^[-d]$' || true)"
+          [[ -z "$bad" ]] || { echo "release.tar holds a member that is not a regular file or folder"; exit 1; }
+          dups="$(tar -tf release/release.tar | sed -e 's#^\(\./\)*##' -e 's#/*$##' | grep -v '^$' | sort | uniq -d || true)"
+          [[ -z "$dups" ]] || { echo "release.tar holds two members with the same name"; exit 1; }
+          mkdir -p unpacked && tar -xf release/release.tar -C unpacked --no-same-owner --no-same-permissions
+          (cd unpacked && for f in agent-image.json skills.tar sbom.spdx.json; do
+            want="$(jq -r --arg f "$f" '.files[$f]' manifest.json)"; got="$(sha256sum "$f" | cut -d' ' -f1)"
+            [[ "$want" == "$got" ]] || { echo "$f does not match the manifest"; exit 1; }
+          done)
+          commit="$(jq -r '.commit // ""' unpacked/manifest.json)"
+          [[ "$commit" == "$merge" ]] || { echo "the manifest's commit $commit is not the release's merge commit $merge"; exit 1; }
+          # agent-image.json is the engine's contract (packages/engine/src/evals/release-digests.ts):
+          # {"imageDigest", "registry", "repository", "skillsHash"?}. The deploy needs registry and repository.
+          imageDigest="$(jq -r '.imageDigest // ""' unpacked/agent-image.json)"
+          registry="$(jq -r '.registry // ""' unpacked/agent-image.json)"; repository="$(jq -r '.repository // ""' unpacked/agent-image.json)"
+          stated="$(jq -r '.skillsHash // ""' unpacked/agent-image.json)"
+          [[ "$imageDigest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "agent-image.json does not name the image by digest"; exit 1; }
+          [[ "$registry" =~ ^[a-z0-9]{5,50}\.azurecr\.io$ && "$registry" == "$T8_REGISTRY_SERVER" ]] || { echo "the image is not in this environment's registry"; exit 1; }
+          # Omar's registry ruling: the image repository is always <solution>/agent.
+          [[ "$repository" == "$T8_SOLUTION/agent" ]] || { echo "agent-image.json names repository $repository, not $T8_SOLUTION/agent"; exit 1; }
+          agentImage="$registry/$repository@$imageDigest"
+          # The platform gateway image is not part of the solution release: the owner pins it, by digest, per environment.
+          gatewayImage="$T8_GATEWAY_IMAGE"
+          image='^[a-z0-9.-]+(:[0-9]{2,5})?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+          [[ "$agentImage" =~ $image && "$gatewayImage" =~ $image ]] || { echo "the images must be pinned by digest"; exit 1; }
+          [[ "${gatewayImage%%/*}" == "$T8_REGISTRY_SERVER" ]] || { echo "the gateway image is not in this environment's registry"; exit 1; }
+          # The skills hash is COMPUTED from skills.tar with the runtime's rule (agent-runtime skills.ts, engine
+          # skillsHashOfTar): every regular file's path ("/" separators, byte order) then "\0<size>\0" then its bytes.
+          mkdir -p skills && tar -xf unpacked/skills.tar -C skills --no-same-owner --no-same-permissions
+          skillsHash="sha256:$(cd skills && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
+          [[ -z "$stated" || "$stated" == "$skillsHash" ]] || { echo "agent-image.json states a skills hash that differs from skills.tar"; exit 1; }
+          if [[ "$ENV_NAME" == "uat" || "$ENV_NAME" == "prod" ]]; then
+            [[ "sha256:${agentImage##*@sha256:}" == "$EVAL_IMAGE_DIGEST" && "$skillsHash" == "$EVAL_SKILLS_HASH" ]] || { echo "the eval record is for another image or skills release: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          fi
+          { echo "AGENT_IMAGE=$agentImage"; echo "GATEWAY_IMAGE=$gatewayImage"; echo "SKILLS_HASH=$skillsHash"; } >> "$GITHUB_ENV"
+          echo "Attestation verified for $digest (commit $merge, signed by release.yml at $signer); agent $agentImage" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Omar B3: the gateway holds the spend caps and the kill switch, so it must be exactly the platform's reviewed
+      # gateway build. The environment's registry copy is accepted only at the digest pinned above. Fails closed.
+      - name: Check the gateway image is the platform's pinned digest
+        run: |
+          set -euo pipefail
+          [[ "$GATEWAY_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "this workflow pins no gateway image digest: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "${GATEWAY_IMAGE:-}" =~ ^[a-z0-9.-]+(:[0-9]{2,5})?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || { echo "the gateway image is not pinned by digest: refused"; exit 1; }
+          [[ "sha256:${GATEWAY_IMAGE##*@sha256:}" == "$GATEWAY_IMAGE_DIGEST" ]] || { echo "the gateway image ${GATEWAY_IMAGE} is not the platform's pinned gateway $GATEWAY_IMAGE_DIGEST: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "Gateway image pinned: $GATEWAY_IMAGE_DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the platform template (never the solution repository)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.platform-repository }}
+          ref: ${{ inputs.platform-sha }}
+          path: platform
+          persist-credentials: false
+          sparse-checkout: solution/t8
+
+      - name: Sign in to Azure (OIDC, this environment's deploy identity)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Parameters come only from this environment's variables and the verified release; images by digest. The
+      # Container Apps are created inside the deployment (never by the Container Apps CLI commands).
+      - name: What-if and deploy the T8 template (images by digest)
+        run: |
+          set -euo pipefail
+          az account show --query "{subscription: id, tenant: tenantId}" -o tsv
+          if [[ "$ENV_NAME" == "uat" || "$ENV_NAME" == "prod" ]]; then [[ -n "${APPROVER_OIDS:-}" ]] || { echo "uat and prod need the engine's approver list: refused"; exit 1; }; fi
+          jq -n --arg environmentName "$ENV_NAME" --arg solution "$T8_SOLUTION" --arg location "$T8_LOCATION" \
+            --arg identityResourceGroup "$T8_IDENTITY_RESOURCE_GROUP" --arg registryServer "$T8_REGISTRY_SERVER" \
+            --arg agentImage "$AGENT_IMAGE" --arg gatewayImage "$GATEWAY_IMAGE" \
+            --arg agentAudience "$T8_AGENT_AUDIENCE" --arg serviceAudience "$T8_SERVICE_AUDIENCE" --arg gatewayAudience "$T8_GATEWAY_AUDIENCE" \
+            --arg skill "$T8_SKILL" --arg skillsHash "$SKILLS_HASH" --argjson model "$T8_MODEL" --argjson claudeProviderData "$T8_CLAUDE_PROVIDER" \
+            --arg maintenanceApiUrl "$T8_MAINTENANCE_API_URL" --arg maintenanceApiScope "$T8_MAINTENANCE_API_SCOPE" \
+            --argjson enableKnowledge "$T8_ENABLE_KNOWLEDGE" --argjson enableTeams "$T8_ENABLE_TEAMS" \
+            --arg chatUsers "$T8_CHAT_USER_OIDS" --arg dailyTurns "${T8_DAILY_TURNS_PER_PERSON:-60}" --arg dailyUsd "${T8_DAILY_USD_PER_PERSON:-10}" \
+            --arg approvers "$APPROVER_OIDS" --arg vnetPrefix "$T8_VNET_PREFIX" --arg approvalsAudience "$T8_APPROVALS_AUDIENCE" \
+            '{"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#", contentVersion: "1.0.0.0", parameters: ({
+              environmentName: $environmentName, solution: $solution, location: $location, identityResourceGroup: $identityResourceGroup,
+              agentIdentityName: "id-\($solution)-\($environmentName)-agent", gatewayIdentityName: "id-\($solution)-\($environmentName)-gateway",
+              approvalIdentityName: "id-\($solution)-\($environmentName)-approval", executorIdentityName: "id-\($solution)-\($environmentName)-executor",
+              approvalDoorIdentityName: "id-\($solution)-\($environmentName)-approvaldoor", approvalsAudience: $approvalsAudience,
+              toolIdentityName: "id-\($solution)-\($environmentName)-tool", pullIdentityName: "id-\($solution)-\($environmentName)-pull",
+              ingestionIdentityName: "id-\($solution)-\($environmentName)-ingestion",
+              registryServer: $registryServer, agentImage: $agentImage, gatewayImage: $gatewayImage,
+              agentAudience: $agentAudience, serviceAudience: $serviceAudience, gatewayAudience: $gatewayAudience,
+              skill: $skill, skillsHash: $skillsHash, model: $model, claudeProviderData: $claudeProviderData,
+              maintenanceApiUrl: $maintenanceApiUrl, maintenanceApiScope: $maintenanceApiScope,
+              enableKnowledge: $enableKnowledge, enableTeams: $enableTeams,
+              approverObjectIds: ($approvers | split(",") | map(select(length > 0))), vnetPrefix: $vnetPrefix,
+              chatUserObjectIds: ($chatUsers | split(",") | map(select(length > 0))), dailyTurnsPerPerson: ($dailyTurns | tonumber), dailyUsdPerPerson: $dailyUsd
+            } | with_entries(.value = {value: .value}))}' > params.json
+          az deployment group what-if -g "$T8_RESOURCE_GROUP" --name "t8-$ENV_NAME-$GITHUB_RUN_ID" --template-file platform/solution/t8/main.bicep --parameters @params.json --no-pretty-print --result-format ResourceIdOnly > whatif.json
+          jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json | tee -a "$GITHUB_STEP_SUMMARY"
+          if jq -e '.changes[] | select(.changeType == "Delete")' whatif.json > /dev/null; then echo "the what-if deletes a resource: refused"; exit 1; fi
+          az deployment group create -g "$T8_RESOURCE_GROUP" --name "t8-$ENV_NAME-$GITHUB_RUN_ID" --template-file platform/solution/t8/main.bicep --parameters @params.json --query properties.outputs -o json > outputs.json
+          for k in agentFqdn; do
+            v="$(jq -r --arg k "$k" '.[$k].value' outputs.json)"; [[ "$v" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "output $k is missing"; exit 1; }
+            echo "T8_OUT_$k=$v" >> "$GITHUB_ENV"
+          done
+          search="$(jq -r '.searchName.value // ""' outputs.json)"
+          [[ -z "$search" || "$search" =~ ^[a-z0-9-]+$ ]] || { echo "output searchName is malformed"; exit 1; }
+          echo "T8_OUT_searchName=$search" >> "$GITHUB_ENV"
+
+      # T8-K: the index definition as code, with an Entra token (the custom search-definitions role on this one service,
+      # grants.bicep; Omar B2: no keys, no service write).
+      - name: Search index definition as code (T8-K)
+        if: vars.T8_ENABLE_KNOWLEDGE == 'true'
+        run: |
+          set -euo pipefail
+          [[ "$T8_OUT_searchName" =~ ^[a-z0-9-]+$ ]] || { echo "no search service in this environment"; exit 1; }
+          SEARCH_NAME="$T8_OUT_searchName"
+          token="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          code="$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 60 -o index.out -w '%{http_code}' -X PUT "https://$SEARCH_NAME.search.windows.net/indexes/documents?api-version=2024-07-01" \
+            -H @- -H "Content-Type: application/json" --data-binary @platform/solution/t8/search/index.json || echo 000)"
+          [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]] || { echo "the index definition was refused ($code)"; exit 1; }
+
+      # Signed out: the health route answers, and the chat route refuses (401).
+      - name: Smoke test (health answers; chat refuses without a sign-in)
+        run: |
+          set -euo pipefail
+          health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$T8_OUT_agentFqdn/healthz")"
+          [[ "$health" == "200" ]] || { echo "the health route answered $health"; exit 1; }
+          chat="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "https://$T8_OUT_agentFqdn/api/chat")"
+          [[ "$chat" == "401" ]] || { echo "the chat route answered $chat signed out"; exit 1; }
+          echo "Deployed $ARTIFACT_DIGEST to $ENV_NAME: health $health, signed-out chat $chat" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign out of Azure
+        if: always()
+        run: az logout || true
