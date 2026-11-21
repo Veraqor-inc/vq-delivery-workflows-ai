@@ -70,6 +70,8 @@ resource mustBeDefs 'Microsoft.Authorization/policyDefinitions@2023-04-01' = [fo
 // The four image checks are written out, not built with a `for` loop: a loop compiles to an ARM copy loop, which
 // evaluates the policy's own '[concat(parameters(...))]' at deploy time and fails ("parameter 'allowedRegistry'
 // not found"). As plain literals Bicep escapes the string ('[[') and Azure Policy evaluates it, as intended.
+// `count.field` names the ARRAY alias (`...containers[*]`); only `where` looks at `.image`. Azure Policy refuses a
+// `count.field` that ends in a property ("InvalidCountExpression", dev deploy 2026-11-21).
 
 resource registryDef 'Microsoft.Authorization/policyDefinitions@2023-04-01' = {
   name: 't8-deny-foreign-registry'
@@ -89,19 +91,19 @@ resource registryDef 'Microsoft.Authorization/policyDefinitions@2023-04-01' = {
           {
             anyOf: [
               {
-                count: { field: 'Microsoft.App/containerApps/template.containers[*].image', where: { field: 'Microsoft.App/containerApps/template.containers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
+                count: { field: 'Microsoft.App/containerApps/template.containers[*]', where: { field: 'Microsoft.App/containerApps/template.containers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
                 greater: 0
               }
               {
-                count: { field: 'Microsoft.App/containerApps/template.initContainers[*].image', where: { field: 'Microsoft.App/containerApps/template.initContainers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
+                count: { field: 'Microsoft.App/containerApps/template.initContainers[*]', where: { field: 'Microsoft.App/containerApps/template.initContainers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
                 greater: 0
               }
               {
-                count: { field: 'Microsoft.App/jobs/template.containers[*].image', where: { field: 'Microsoft.App/jobs/template.containers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
+                count: { field: 'Microsoft.App/jobs/template.containers[*]', where: { field: 'Microsoft.App/jobs/template.containers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
                 greater: 0
               }
               {
-                count: { field: 'Microsoft.App/jobs/template.initContainers[*].image', where: { field: 'Microsoft.App/jobs/template.initContainers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
+                count: { field: 'Microsoft.App/jobs/template.initContainers[*]', where: { field: 'Microsoft.App/jobs/template.initContainers[*].image', notLike: '[concat(parameters(\'allowedRegistry\'), \'/*\')]' } }
                 greater: 0
               }
             ]
