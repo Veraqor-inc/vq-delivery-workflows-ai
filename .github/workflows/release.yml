@@ -1,0 +1,283 @@
+# The ai family's reusable RELEASE workflow for T8 (M13 3.3 "Artifact: the agent image by digest plus the skills
+# release by hash"; 3.3.1 item 2; same pattern and rules as the web family's templates/release/release.yml). LOCAL
+# TEMPLATE: published as .github/workflows/release.yml in the ai family's platform repository only after review.
+# Its rules are checked by test/t8-release-workflow.test.ts.
+#
+# Build ONCE, deploy many. Two jobs, so that no job that runs the solution's code ever holds an identity:
+#  - build:  checks out and builds the merge commit: the agent's tests, the agent IMAGE as an OCI archive (no
+#            registry, no push, no identity), the skills release as skills.tar, an SBOM, and agent-image.json in the
+#            engine's format. Packs one file, release.tar. Permissions contents: read only: no id-token, no
+#            secrets, no environment, no Azure.
+#  - attest: never checks out or runs the solution's code. It downloads release.tar and image.oci.tar, checks both
+#            digests against the build, RECOMPUTES the image's manifest digest from image.oci.tar and the skills hash
+#            from skills.tar and compares them with agent-image.json (Omar B7), and only then signs build provenance
+#            (both files) and the SBOM. id-token: write is for
+#            Sigstore's certificate only; the token names no environment, so no Azure federated credential matches.
+#
+# release.tar holds: agent-image.json, skills.tar, sbom.spdx.json, test-results/ and manifest.json (which also lists
+# image.oci.tar's hash, binding the image to the release). agent-image.json is exactly
+# {"imageDigest", "registry", "repository", "skillsHash"} (packages/engine/src/evals/release-digests.ts): the image's
+# manifest digest, where the engine pushes it by digest, and the skills hash COMPUTED from skills.tar with the
+# runtime's rule. The engine pushes image.oci.tar by digest into the eval registry and the solution's registry.
+# Omar B5: the image is the ONLY source of skills at run time. The image build copies the same skills folder into its
+# build context; skills.tar is the evaluated, hashed copy of those files, and the agent refuses to start unless the
+# skills in its image hash to the released skills hash (SKILLS_HASH, set by the deploy).
+# Omar's registry ruling (security-review-m13-t8-code.md section 3): the registry and image repository are NEVER
+# inputs, variables or files of the solution repository. The "target" job (no checkout, no solution code) asks the
+# engine gate for the values the engine recorded for this project at landing (the repository is always
+# <solution>/agent); the engine refuses to record any release whose agent-image.json names anything else.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      agent-directory:
+        description: Folder of the agent (package.json, package-lock.json, Dockerfile)
+        type: string
+        required: true
+      skills-directory:
+        description: Folder of the skills (one folder per skill)
+        type: string
+        default: skills
+    outputs:
+      digest:
+        description: sha256 digest of release.tar (sha256:<64 hex>)
+        value: ${{ jobs.attest.outputs.digest }}
+
+permissions: {}
+
+# FIXED BY THE PLATFORM: filled in when published in the ai family's platform repository; left unfilled, every release
+# stops at "Ask the engine". None is secret.
+env:
+  RELEASE_GATE_URL: __RELEASE_GATE_URL__
+  RELEASE_GATE_AUDIENCE: __RELEASE_GATE_AUDIENCE__
+
+jobs:
+  target:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    outputs:
+      registry: ${{ steps.ask.outputs.registry }}
+      repository: ${{ steps.ask.outputs.repository }}
+    steps:
+      # No checkout: no solution code runs here. The token names no environment, so no Azure credential matches it.
+      - name: Ask the engine for this project's registry and image repository
+        id: ask
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "a release is built from main only"; exit 1; }
+          [[ "$RELEASE_GATE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?/[A-Za-z0-9/._-]*$ ]] || { echo "the platform's gate address is not set"; exit 1; }
+          [[ "$RELEASE_GATE_AUDIENCE" =~ ^[A-Za-z0-9:/._-]{3,200}$ && "${RELEASE_GATE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "the platform's gate audience is not set"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_GATE_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the gate"; exit 1; }
+          echo "::add-mask::$token"
+          code="$(curl -sS --max-time 30 -o target.json -w '%{http_code}' -X POST "$RELEASE_GATE_URL" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data '{"request":"release-target"}' || echo 000)"
+          registry="$(jq -r '.registry // ""' target.json 2>/dev/null || true)"
+          repository="$(jq -r '.repository // ""' target.json 2>/dev/null || true)"
+          reason="$(jq -r '.reason // "no answer"' target.json 2>/dev/null || echo "no answer")"
+          rm -f target.json
+          [[ "$code" == "200" ]] || { echo "the engine gave no release target ($code): $reason" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "$registry" =~ ^[a-z0-9]{5,50}\.azurecr\.io$ ]] || { echo "the engine's registry is not <name>.azurecr.io"; exit 1; }
+          [[ "$repository" =~ ^[a-z0-9]{3,12}/agent$ ]] || { echo "the engine's image repository is not <solution>/agent"; exit 1; }
+          { echo "registry=$registry"; echo "repository=$repository"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.pack.outputs.digest }}
+      image-archive-digest: ${{ steps.pack.outputs.image-archive-digest }}
+    env:
+      AGENT_DIR: ${{ inputs.agent-directory }}
+      SKILLS_DIR: ${{ inputs.skills-directory }}
+      REGISTRY: ${{ needs.target.outputs.registry }}
+      REPOSITORY: ${{ needs.target.outputs.repository }}
+      OUT: ${{ github.workspace }}/release-out
+    steps:
+      - name: Check out
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          path='^[A-Za-z0-9._/-]{1,150}$'
+          [[ "$AGENT_DIR" =~ $path && "$SKILLS_DIR" =~ $path ]] || { echo "agent-directory and skills-directory must be plain paths"; exit 1; }
+          [[ "$AGENT_DIR" != *..* && "$SKILLS_DIR" != *..* ]] || { echo "no .. in paths"; exit 1; }
+          [[ "$REGISTRY" =~ ^[a-z0-9]{5,50}\.azurecr\.io$ ]] || { echo "registry must be <name>.azurecr.io"; exit 1; }
+          [[ "$REPOSITORY" =~ ^[a-z0-9]{3,12}/agent$ ]] || { echo "repository is not <solution>/agent"; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "a release is built from main only"; exit 1; }
+          test -f "$AGENT_DIR/Dockerfile" || { echo "$AGENT_DIR/Dockerfile is required"; exit 1; }
+          test -d "$SKILLS_DIR" || { echo "$SKILLS_DIR is missing"; exit 1; }
+          mkdir -p "$OUT/test-results"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Build and test the agent (lock file, no install scripts)
+        working-directory: ${{ inputs.agent-directory }}
+        run: |
+          set -euo pipefail
+          test -f package-lock.json || { echo "package-lock.json is required"; exit 1; }
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          npm run build
+          npm test --if-present -- --reporter=default --reporter=junit --outputFile="$OUT/test-results/agent-junit.xml"
+
+      # The image is built into an OCI ARCHIVE on the runner: no registry, no login, no push, no identity. buildah and
+      # skopeo come with the GitHub-hosted ubuntu-24.04 image [verify the versions on the runner]. The skills folder is
+      # copied into the build context as skills/ (Omar B5: the image is the only source of skills at run time).
+      - name: Build the agent image as an OCI archive (no push)
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/image-context"
+          rm -rf "$context" && mkdir -p "$context"
+          cp -R "$AGENT_DIR/." "$context/"
+          rm -rf "$context/skills" && cp -R "$SKILLS_DIR" "$context/skills"
+          buildah build --format oci --layers=false --pull=always -f "$context/Dockerfile" -t localhost/agent:release "$context"
+          buildah push localhost/agent:release "oci-archive:$OUT/image.oci.tar"
+          imageDigest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$OUT/image.oci.tar")"
+          [[ "$imageDigest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "the image has no manifest digest"; exit 1; }
+          echo "IMAGE_DIGEST=$imageDigest" >> "$GITHUB_ENV"
+
+      # skills.tar: regular files only, sorted, fixed owner and time, so the same skills give the same bytes. The
+      # skills hash is COMPUTED with the runtime's rule (agent-runtime skills.ts; engine skillsHashOfTar): every
+      # regular file's path ("/" separators, byte order), then "\0<size>\0", then its bytes.
+      - name: Pack the skills release and compute its hash
+        run: |
+          set -euo pipefail
+          bad="$(find "$SKILLS_DIR" -mindepth 1 ! -type f ! -type d -print)"
+          [[ -z "$bad" ]] || { echo "the skills folder holds something that is not a regular file or folder: $bad"; exit 1; }
+          (cd "$SKILLS_DIR" && find . -type f | sed 's#^\./##' | LC_ALL=C sort > "$RUNNER_TEMP/skills.list")
+          [[ -s "$RUNNER_TEMP/skills.list" ]] || { echo "the skills folder holds no files"; exit 1; }
+          tar --owner=0 --group=0 --numeric-owner --mtime='@0' -C "$SKILLS_DIR" -cf "$OUT/skills.tar" -T "$RUNNER_TEMP/skills.list"
+          skillsHash="sha256:$(cd "$SKILLS_DIR" && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
+          echo "SKILLS_HASH=$skillsHash" >> "$GITHUB_ENV"
+
+      - name: Make the SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-out/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Pack release.tar and record its digest
+        id: pack
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          for f in image.oci.tar skills.tar sbom.spdx.json; do [[ -f "$f" && ! -L "$f" && -s "$f" ]] || { echo "$f is missing or not a regular file"; exit 1; }; done
+          find test-results -mindepth 1 ! -type f ! -type d -print -delete | sed 's/^/dropped (not a regular file): /'
+          # The engine's agent-image.json format, exactly these four keys.
+          jq -n --arg imageDigest "$IMAGE_DIGEST" --arg registry "$REGISTRY" --arg repository "$REPOSITORY" --arg skillsHash "$SKILLS_HASH" \
+            '{imageDigest: $imageDigest, registry: $registry, repository: $repository, skillsHash: $skillsHash}' > agent-image.json
+          jq -n --arg commit "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" --arg run "$GITHUB_RUN_ID" \
+            --arg image "$(sha256sum agent-image.json | cut -d' ' -f1)" --arg skills "$(sha256sum skills.tar | cut -d' ' -f1)" \
+            --arg sbom "$(sha256sum sbom.spdx.json | cut -d' ' -f1)" --arg oci "$(sha256sum image.oci.tar | cut -d' ' -f1)" \
+            '{commit: $commit, repository: $repo, run: $run, files: {"agent-image.json": $image, "skills.tar": $skills, "sbom.spdx.json": $sbom, "image.oci.tar": $oci}}' > manifest.json
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' -cf "$GITHUB_WORKSPACE/release.tar" agent-image.json skills.tar sbom.spdx.json manifest.json test-results
+          mv image.oci.tar "$GITHUB_WORKSPACE/image.oci.tar"
+          digest="sha256:$(sha256sum "$GITHUB_WORKSPACE/release.tar" | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image-archive-digest=sha256:$(sha256sum "$GITHUB_WORKSPACE/image.oci.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "Release digest: $digest (commit $GITHUB_SHA); image $IMAGE_DIGEST; skills $SKILLS_HASH" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release.tar
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release
+          path: release.tar
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload the image archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: agent-image
+          path: image.oci.tar
+          retention-days: 30
+          if-no-files-found: error
+
+  attest:
+    needs: [target, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.check.outputs.digest }}
+    env:
+      BUILT_DIGEST: ${{ needs.build.outputs.digest }}
+      BUILT_IMAGE_ARCHIVE: ${{ needs.build.outputs.image-archive-digest }}
+      TARGET_REGISTRY: ${{ needs.target.outputs.registry }}
+      TARGET_REPOSITORY: ${{ needs.target.outputs.repository }}
+    steps:
+      - name: "Download release.tar (no checkout: no solution code runs here)"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+
+      - name: "Download the image archive (no checkout)"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-image
+
+      # Omar B7: what is signed is recomputed here, not taken from the build job's word. The image's manifest digest
+      # comes from image.oci.tar's index.json (exactly one manifest, whose blob must hash to it); the skills hash from
+      # skills.tar with the runtime's rule. Any mismatch with agent-image.json stops the job before anything is signed.
+      - name: Check the digests match the build and the manifest binds the image
+        id: check
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum release.tar | cut -d' ' -f1)"
+          [[ "$digest" == "$BUILT_DIGEST" ]] || { echo "digest mismatch: built $BUILT_DIGEST, downloaded $digest"; exit 1; }
+          archive="sha256:$(sha256sum image.oci.tar | cut -d' ' -f1)"
+          [[ "$archive" == "$BUILT_IMAGE_ARCHIVE" ]] || { echo "image archive mismatch"; exit 1; }
+          bad="$(tar -tvf release.tar | cut -c1 | grep -v '^[-d]$' || true)"
+          [[ -z "$bad" ]] || { echo "release.tar holds a member that is not a regular file or folder"; exit 1; }
+          dups="$(tar -tf release.tar | sed -e 's#^\(\./\)*##' -e 's#/*$##' | grep -v '^$' | sort | uniq -d || true)"
+          [[ -z "$dups" ]] || { echo "release.tar holds two members with the same name"; exit 1; }
+          tar -xf release.tar --no-same-owner --no-same-permissions sbom.spdx.json manifest.json agent-image.json
+          [[ "$(jq -r '.files["image.oci.tar"]' manifest.json)" == "${archive#sha256:}" ]] || { echo "the manifest does not bind this image archive"; exit 1; }
+          [[ "$(jq -r 'keys | join(",")' agent-image.json)" == "imageDigest,registry,repository,skillsHash" ]] || { echo "agent-image.json is not in the engine's format"; exit 1; }
+          [[ "$(jq -r '.registry' agent-image.json)" == "$TARGET_REGISTRY" && "$(jq -r '.repository' agent-image.json)" == "$TARGET_REPOSITORY" ]] || { echo "agent-image.json does not name the engine's registry and image repository: refused"; exit 1; }
+          check="$RUNNER_TEMP/attest-check"
+          rm -rf "$check" && mkdir -p "$check/oci" "$check/skills"
+          tar -xf image.oci.tar -C "$check/oci" --no-same-owner --no-same-permissions index.json
+          [[ "$(jq -r '.manifests | length' "$check/oci/index.json")" == "1" ]] || { echo "image.oci.tar must hold exactly one manifest"; exit 1; }
+          manifest="$(jq -r '.manifests[0].digest // ""' "$check/oci/index.json")"
+          [[ "$manifest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "image.oci.tar names no manifest digest"; exit 1; }
+          blob="$(tar -xOf image.oci.tar "blobs/sha256/${manifest#sha256:}" | sha256sum | cut -d' ' -f1)"
+          [[ "sha256:$blob" == "$manifest" ]] || { echo "the manifest blob in image.oci.tar does not hash to its digest"; exit 1; }
+          [[ "$(jq -r '.imageDigest' agent-image.json)" == "$manifest" ]] || { echo "agent-image.json imageDigest is not the image's manifest digest $manifest: refused"; exit 1; }
+          tar -xf release.tar --no-same-owner --no-same-permissions -C "$check" skills.tar
+          bad="$(tar -tvf "$check/skills.tar" | cut -c1 | grep -v '^[-d]$' || true)"
+          [[ -z "$bad" ]] || { echo "skills.tar holds a member that is not a regular file or folder"; exit 1; }
+          tar -xf "$check/skills.tar" -C "$check/skills" --no-same-owner --no-same-permissions
+          skills="sha256:$(cd "$check/skills" && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
+          [[ "$(jq -r '.skillsHash' agent-image.json)" == "$skills" ]] || { echo "agent-image.json skillsHash is not the hash of skills.tar ($skills): refused"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance (release.tar and the image archive)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release.tar
+            image.oci.tar
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: release.tar
+          sbom-path: sbom.spdx.json
