@@ -125,6 +125,9 @@ jobs:
       T8_CHAT_USER_OIDS: ${{ vars.T8_CHAT_USER_OIDS }}
       T8_DAILY_TURNS_PER_PERSON: ${{ vars.T8_DAILY_TURNS_PER_PERSON }}
       T8_DAILY_USD_PER_PERSON: ${{ vars.T8_DAILY_USD_PER_PERSON }}
+      # The approval key's VERSIONED ID: main.bicep output approvalKeyId of the owner's one-time key sitting (Omar K1-K4).
+      # This workflow never creates the key and never opens the vault: it never passes createApprovalKey.
+      T8_APPROVAL_KEY_ID: ${{ vars.T8_APPROVAL_KEY_ID }}
     steps:
       - name: Check inputs (main only; who may start which environment; the platform's fixed endpoints)
         run: |
@@ -152,6 +155,8 @@ jobs:
           audience='^[A-Za-z0-9:/._-]{3,200}$'
           oids='^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$'
           [[ "$T8_APPROVALS_AUDIENCE" =~ $audience && "${T8_APPROVALS_AUDIENCE,,}" != "${T8_AGENT_AUDIENCE,,}" ]] || { echo "T8_APPROVALS_AUDIENCE must be set and differ from the agent's chat audience"; exit 1; }
+          keyid='^https://kv-[a-z0-9]{1,21}[.]vault[.]azure[.]net/keys/approval/[0-9a-f]{32}$'
+          [[ "$T8_APPROVAL_KEY_ID" =~ $keyid ]] || { echo "T8_APPROVAL_KEY_ID must be the approval key's versioned ID from the owner's key sitting"; exit 1; }
           case "$ENV_NAME" in
             dev|qa)
               [[ "$GITHUB_EVENT_NAME" == "push" ]] || { echo "dev and qa deploy only after a push to main"; exit 1; }
@@ -376,11 +381,13 @@ jobs:
             --argjson enableKnowledge "$T8_ENABLE_KNOWLEDGE" --argjson enableTeams "$T8_ENABLE_TEAMS" \
             --arg chatUsers "$T8_CHAT_USER_OIDS" --arg dailyTurns "${T8_DAILY_TURNS_PER_PERSON:-60}" --arg dailyUsd "${T8_DAILY_USD_PER_PERSON:-10}" \
             --arg approvers "$APPROVER_OIDS" --arg vnetPrefix "$T8_VNET_PREFIX" --arg approvalsAudience "$T8_APPROVALS_AUDIENCE" \
+            --arg approvalKeyId "$T8_APPROVAL_KEY_ID" \
             '{"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#", contentVersion: "1.0.0.0", parameters: ({
               environmentName: $environmentName, solution: $solution, location: $location, identityResourceGroup: $identityResourceGroup,
               agentIdentityName: "id-\($solution)-\($environmentName)-agent", gatewayIdentityName: "id-\($solution)-\($environmentName)-gateway",
               approvalIdentityName: "id-\($solution)-\($environmentName)-approval", executorIdentityName: "id-\($solution)-\($environmentName)-executor",
               approvalDoorIdentityName: "id-\($solution)-\($environmentName)-approvaldoor", approvalsAudience: $approvalsAudience,
+              approvalKeyId: $approvalKeyId,
               toolIdentityName: "id-\($solution)-\($environmentName)-tool", pullIdentityName: "id-\($solution)-\($environmentName)-pull",
               ingestionIdentityName: "id-\($solution)-\($environmentName)-ingestion",
               registryServer: $registryServer, agentImage: $agentImage, gatewayImage: $gatewayImage,
@@ -395,6 +402,7 @@ jobs:
           jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json | tee -a "$GITHUB_STEP_SUMMARY"
           if jq -e '.changes[] | select(.changeType == "Delete")' whatif.json > /dev/null; then echo "the what-if deletes a resource: refused"; exit 1; fi
           az deployment group create -g "$T8_RESOURCE_GROUP" --name "t8-$ENV_NAME-$GITHUB_RUN_ID" --template-file platform/solution/t8/main.bicep --parameters @params.json --query properties.outputs -o json > outputs.json
+          [[ "$(jq -r '.keyVaultBypass.value' outputs.json)" == "None" ]] || { echo "the vault's trusted-services bypass is not None after the deploy" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
           for k in agentFqdn; do
             v="$(jq -r --arg k "$k" '.[$k].value' outputs.json)"; [[ "$v" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "output $k is missing"; exit 1; }
             echo "T8_OUT_$k=$v" >> "$GITHUB_ENV"
