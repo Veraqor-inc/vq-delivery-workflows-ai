@@ -68,13 +68,15 @@ param agentImage string
 @description('The platform gateway image by digest.')
 param gatewayImage string
 
-@description('Application ID URI of the agent\'s API (the audience of the people\'s tokens). Not a secret.')
+// Audiences are plain application (client) IDs (GUIDs), not api://<appId>: every T8 registration issues v2 tokens
+// (requestedAccessTokenVersion 2), the apps accept only the v2 issuer, and a v2 token's aud claim is the appId.
+@description('Application (client) ID GUID of the agent\'s API registration (the aud of the people\'s v2 tokens). Not a secret.')
 param agentAudience string
-@description('Application ID URI the four apps use between themselves (service-to-service tokens). Not a secret.')
+@description('Application (client) ID GUID the apps use between themselves (aud of the service-to-service v2 tokens). Not a secret.')
 param serviceAudience string
-@description('Application ID URI of the APPROVALS API (its own app registration, delegated scope Approvals.Decide only; Omar A1(a)). Must differ from agentAudience. Not a secret.')
+@description('Application (client) ID GUID of the APPROVALS API (its own app registration, delegated scope Approvals.Decide only; Omar A1(a)); aud of the approver\'s v2 token. Must differ from agentAudience. Not a secret.')
 param approvalsAudience string
-@description('Application ID URI of the gateway (the agent\'s managed-identity token audience). Not a secret.')
+@description('Application (client) ID GUID of the gateway audience (aud of the agent\'s managed-identity v2 token). Not a secret.')
 param gatewayAudience string
 
 @description('Skill the agent loads (a folder under skills/).')
@@ -159,8 +161,10 @@ var checkedModelCapacity = int(model.capacity) >= 1 && int(model.capacity) <= ma
 // ---------- Approvals (Omar A1): an approver list in uat and prod, and an approvals audience of its own ----------
 var checkedApprovers = isPrivateTier && empty(approverObjectIds) ? json('${environmentName} needs an approver list (approverObjectIds): an empty list lets anyone in the tenant approve') : approverObjectIds
 // Object ID lists (approvers and chat users): every entry a lower-case-able GUID. Removing the 16 hex digits must leave
-// exactly the four dashes, in the 8-4-4-4-12 places.
-var oidProblems = filter(concat(approverObjectIds, chatUserObjectIds), o => length(string(o)) != 36 || replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(toLower(string(o)), '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '') != '----' || substring(padLeft(string(o), 36, 'x'), 8, 1) != '-' || substring(padLeft(string(o), 36, 'x'), 13, 1) != '-' || substring(padLeft(string(o), 36, 'x'), 18, 1) != '-' || substring(padLeft(string(o), 36, 'x'), 23, 1) != '-')
+// exactly the four dashes, in the 8-4-4-4-12 places. The dash checks read a copy padded to at least 36 characters by
+// concatenation (ARM's padLeft allows a width of at most 16), so a short entry fails the length check, not substring().
+var oidPad = '000000000000000000000000000000000000'
+var oidProblems = filter(concat(approverObjectIds, chatUserObjectIds), o => length(string(o)) != 36 || replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(toLower(string(o)), '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '') != '----' || substring('${string(o)}${oidPad}', 8, 1) != '-' || substring('${string(o)}${oidPad}', 13, 1) != '-' || substring('${string(o)}${oidPad}', 18, 1) != '-' || substring('${string(o)}${oidPad}', 23, 1) != '-')
 var approversLower = map(approverObjectIds, o => toLower(string(o)))
 var chatUsersLower = map(chatUserObjectIds, o => toLower(string(o)))
 var oidOverlap = intersection(approversLower, chatUsersLower)
