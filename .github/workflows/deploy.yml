@@ -101,6 +101,7 @@ jobs:
       ROLLBACK: ${{ inputs.rollback }}
       # This environment's identifiers (GitHub environment VARIABLES set by the environment owner; nothing secret).
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       T8_RESOURCE_GROUP: ${{ vars.T8_RESOURCE_GROUP }}
       T8_SOLUTION: ${{ vars.T8_SOLUTION }}
       T8_LOCATION: ${{ vars.T8_LOCATION }}
@@ -381,12 +382,31 @@ jobs:
           persist-credentials: false
           sparse-checkout: solution/t8
 
+      # Actions-policy replacement for azure/login (Omar, "Actions-policy replacements", Step A): inline OIDC sign-in with
+      # the Azure CLI already on the runner. Same federated credential, subject and audience; no third-party code.
       - name: Sign in to Azure (OIDC, this environment's deploy identity)
-        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/az-oidc-login.sh" <<'LOGIN'
+          az_oidc_login() {
+            set +x
+            local guid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' t tenant sub user kind
+            [[ "${AZURE_CLIENT_ID:-}" =~ $guid && "${AZURE_TENANT_ID:-}" =~ $guid && "${AZURE_SUBSCRIPTION_ID:-}" =~ $guid ]] || { echo "sign-in: the client, tenant or subscription is not a GUID"; return 1; }
+            [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] || { echo "sign-in: this job has no id-token: write"; return 1; }
+            t="$(curl -sSf --proto '=https' --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api%3A%2F%2FAzureADTokenExchange" | jq -r '.value')"
+            [[ -n "$t" && "$t" != "null" ]] || { echo "sign-in: no OIDC token"; return 1; }
+            echo "::add-mask::$t"
+            az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" --federated-token "$t" --allow-no-subscriptions -o none
+            t=""; unset t
+            az account set --subscription "$AZURE_SUBSCRIPTION_ID" -o none
+            read -r tenant sub user kind < <(az account show --query "[tenantId, id, user.name, user.type]" -o tsv | tr '\n' ' '; echo)
+            [[ "$tenant" == "$AZURE_TENANT_ID" && "$sub" == "$AZURE_SUBSCRIPTION_ID" && "$user" == "$AZURE_CLIENT_ID" && "$kind" == "servicePrincipal" ]] || { echo "sign-in: signed in as something other than this environment's deploy identity"; return 1; }
+            echo "Signed in: tenant $tenant, subscription $sub, client $user"
+          }
+          LOGIN
+          source "$RUNNER_TEMP/az-oidc-login.sh"
+          az_oidc_login
 
       # Parameters come only from this environment's variables and the verified release; images by digest. The
       # Container Apps are created inside the deployment (never by the Container Apps CLI commands).
@@ -462,4 +482,4 @@ jobs:
 
       - name: Sign out of Azure
         if: always()
-        run: az logout || true
+        run: az logout || true; az account clear || true

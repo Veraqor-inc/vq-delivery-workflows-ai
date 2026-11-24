@@ -175,14 +175,32 @@ jobs:
           skillsHash="sha256:$(cd "$SKILLS_DIR" && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
           echo "SKILLS_HASH=$skillsHash" >> "$GITHUB_ENV"
 
+      # Actions-policy replacement for anchore/sbom-action (Omar, "Actions-policy replacements", Step B): Syft's release
+      # binary, pinned by version and by the SHA-256 recorded in the review file. Runs only in a job with no identity.
+      # Pin (Omar, "Pins and follow-ups read back", security-review-m13-t7-design.md; same pin in T1, T7, T8): Syft 1.57.1,
+      # linux_amd64 tarball SHA-256 from syft_1.57.1_checksums.txt after cosign verify-blob "Verified OK" (cosign identity:
+      # anchore/syft release workflow on refs/heads/main, GitHub issuer); tag v1.57.1 -> commit
+      # a0c0d3890a9d79421c403e8fcadec50a2e55bf21 equals the certificate's workflow commit. A new pin repeats all four checks.
       - name: Make the SBOM (SPDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: spdx-json
-          output-file: release-out/sbom.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+        shell: bash
+        env:
+          SYFT_VERSION: "1.57.1"
+          SYFT_SHA256: "bf52519eb57f675d47c07d43213cb6dff6449f3d6d1147ff6701ed91f44eef0c"
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          [[ "$SYFT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$SYFT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "the Syft pin is not filled in: refused"; exit 1; }
+          [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] || { echo "the SBOM step must not run in a job that can mint an OIDC token"; exit 1; }
+          tool="$RUNNER_TEMP/syft-bin"; rm -rf "$tool"; mkdir -p "$tool"
+          curl -sSfL --proto '=https' --max-time 120 -o "$tool/syft.tar.gz" "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "$SYFT_SHA256  $tool/syft.tar.gz" | sha256sum -c --strict --quiet -
+          tar -xzf "$tool/syft.tar.gz" -C "$tool" --no-same-owner --no-same-permissions syft
+          [[ -f "$tool/syft" && ! -L "$tool/syft" ]] || { echo "the Syft archive holds no syft binary"; exit 1; }
+          chmod 0755 "$tool/syft"
+          mkdir -p release-out
+          "$tool/syft" scan dir:. --exclude './release-out/**' --source-name "$GITHUB_REPOSITORY" --source-version "$GITHUB_SHA" -o "spdx-json=release-out/sbom.spdx.json" -q
+          jq -e '.spdxVersion == "SPDX-2.3"' release-out/sbom.spdx.json > /dev/null || { echo "the SBOM is not SPDX 2.3 JSON"; exit 1; }
+          rm -rf "$tool"
 
       - name: Pack release.tar and record its digest
         id: pack
