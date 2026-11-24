@@ -81,10 +81,7 @@ param approvalsAudience string
 @description('Application (client) ID GUID of the gateway audience (aud of the agent\'s managed-identity v2 token). Not a secret.')
 param gatewayAudience string
 
-@description('Skill the agent loads (a folder under skills/).')
-param skill string
-
-@description('The skills hash of the release being deployed (sha256:<64 hex>). The image is the ONLY source of skills (Omar B5): the agent refuses to start unless the skills inside its image hash to exactly this value.')
+@description('The skills hash of the release being deployed (sha256:<64 hex>). The image is the ONLY source of skills (Omar B5): the agent refuses to start unless the skills inside its image hash to exactly this value. The agent loads EVERY skill in its image, and its tools follow those skills (Omar M1, option a): there is no deploy-time skill choice, so the exam sees exactly what ships.')
 param skillsHash string
 
 @description('The Claude deployment: name, model, version, sku (DataZoneStandard), capacity (30 or less: Omar M19-3, VQ Data Zone quota).')
@@ -582,7 +579,6 @@ resource agentApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'ROLE', value: 'agent' }
             { name: 'AZURE_CLIENT_ID', value: agentId.properties.clientId }
             { name: 'TOOL_CLIENT_ID', value: toolId.properties.clientId }
-            { name: 'SKILL', value: skill }
             { name: 'SKILLS_HASH', value: checkedSkillsHash }
             { name: 'CHAT_USER_OIDS', value: checkedChatUsers }
             { name: 'DAILY_TURNS_PER_PERSON', value: string(dailyTurnsPerPerson) }
