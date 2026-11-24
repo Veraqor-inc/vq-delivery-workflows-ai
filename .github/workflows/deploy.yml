@@ -101,6 +101,7 @@ jobs:
       ROLLBACK: ${{ inputs.rollback }}
       # This environment's identifiers (GitHub environment VARIABLES set by the environment owner; nothing secret).
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       T8_RESOURCE_GROUP: ${{ vars.T8_RESOURCE_GROUP }}
       T8_SOLUTION: ${{ vars.T8_SOLUTION }}
       T8_LOCATION: ${{ vars.T8_LOCATION }}
@@ -110,7 +111,6 @@ jobs:
       T8_AGENT_AUDIENCE: ${{ vars.T8_AGENT_AUDIENCE }}
       T8_SERVICE_AUDIENCE: ${{ vars.T8_SERVICE_AUDIENCE }}
       T8_GATEWAY_AUDIENCE: ${{ vars.T8_GATEWAY_AUDIENCE }}
-      T8_SKILL: ${{ vars.T8_SKILL }}
       T8_MODEL: ${{ vars.T8_MODEL }}
       T8_CLAUDE_PROVIDER: ${{ vars.T8_CLAUDE_PROVIDER }}
       T8_MAINTENANCE_API_URL: ${{ vars.T8_MAINTENANCE_API_URL }}
@@ -382,12 +382,31 @@ jobs:
           persist-credentials: false
           sparse-checkout: solution/t8
 
+      # Actions-policy replacement for azure/login (Omar, "Actions-policy replacements", Step A): inline OIDC sign-in with
+      # the Azure CLI already on the runner. Same federated credential, subject and audience; no third-party code.
       - name: Sign in to Azure (OIDC, this environment's deploy identity)
-        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/az-oidc-login.sh" <<'LOGIN'
+          az_oidc_login() {
+            set +x
+            local guid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' t tenant sub user kind
+            [[ "${AZURE_CLIENT_ID:-}" =~ $guid && "${AZURE_TENANT_ID:-}" =~ $guid && "${AZURE_SUBSCRIPTION_ID:-}" =~ $guid ]] || { echo "sign-in: the client, tenant or subscription is not a GUID"; return 1; }
+            [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] || { echo "sign-in: this job has no id-token: write"; return 1; }
+            t="$(curl -sSf --proto '=https' --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api%3A%2F%2FAzureADTokenExchange" | jq -r '.value')"
+            [[ -n "$t" && "$t" != "null" ]] || { echo "sign-in: no OIDC token"; return 1; }
+            echo "::add-mask::$t"
+            az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" --federated-token "$t" --allow-no-subscriptions -o none
+            t=""; unset t
+            az account set --subscription "$AZURE_SUBSCRIPTION_ID" -o none
+            read -r tenant sub user kind < <(az account show --query "[tenantId, id, user.name, user.type]" -o tsv | tr '\n' ' '; echo)
+            [[ "$tenant" == "$AZURE_TENANT_ID" && "$sub" == "$AZURE_SUBSCRIPTION_ID" && "$user" == "$AZURE_CLIENT_ID" && "$kind" == "servicePrincipal" ]] || { echo "sign-in: signed in as something other than this environment's deploy identity"; return 1; }
+            echo "Signed in: tenant $tenant, subscription $sub, client $user"
+          }
+          LOGIN
+          source "$RUNNER_TEMP/az-oidc-login.sh"
+          az_oidc_login
 
       # Parameters come only from this environment's variables and the verified release; images by digest. The
       # Container Apps are created inside the deployment (never by the Container Apps CLI commands).
@@ -400,7 +419,7 @@ jobs:
             --arg identityResourceGroup "$T8_IDENTITY_RESOURCE_GROUP" --arg registryServer "$T8_REGISTRY_SERVER" \
             --arg agentImage "$AGENT_IMAGE" --arg gatewayImage "$GATEWAY_IMAGE" \
             --arg agentAudience "$T8_AGENT_AUDIENCE" --arg serviceAudience "$T8_SERVICE_AUDIENCE" --arg gatewayAudience "$T8_GATEWAY_AUDIENCE" \
-            --arg skill "$T8_SKILL" --arg skillsHash "$SKILLS_HASH" --argjson model "$T8_MODEL" --argjson claudeProviderData "$T8_CLAUDE_PROVIDER" \
+            --arg skillsHash "$SKILLS_HASH" --argjson model "$T8_MODEL" --argjson claudeProviderData "$T8_CLAUDE_PROVIDER" \
             --arg maintenanceApiUrl "$T8_MAINTENANCE_API_URL" --arg maintenanceApiScope "$T8_MAINTENANCE_API_SCOPE" \
             --argjson enableKnowledge "$T8_ENABLE_KNOWLEDGE" --argjson enableTeams "$T8_ENABLE_TEAMS" \
             --arg chatUsers "$T8_CHAT_USER_OIDS" --arg dailyTurns "${T8_DAILY_TURNS_PER_PERSON:-60}" --arg dailyUsd "${T8_DAILY_USD_PER_PERSON:-10}" \
@@ -416,12 +435,14 @@ jobs:
               ingestionIdentityName: "id-\($solution)-\($environmentName)-ingestion",
               registryServer: $registryServer, agentImage: $agentImage, gatewayImage: $gatewayImage,
               agentAudience: $agentAudience, serviceAudience: $serviceAudience, gatewayAudience: $gatewayAudience,
-              skill: $skill, skillsHash: $skillsHash, model: $model, claudeProviderData: $claudeProviderData,
+              skillsHash: $skillsHash, model: $model, claudeProviderData: $claudeProviderData,
               maintenanceApiUrl: $maintenanceApiUrl, maintenanceApiScope: $maintenanceApiScope,
               enableKnowledge: $enableKnowledge, enableTeams: $enableTeams,
               approverObjectIds: ($approvers | split(",") | map(select(length > 0))), vnetPrefix: $vnetPrefix,
               chatUserObjectIds: ($chatUsers | split(",") | map(select(length > 0))), dailyTurnsPerPerson: ($dailyTurns | tonumber), dailyUsdPerPerson: $dailyUsd
             } | with_entries(.value = {value: .value}))}' > params.json
+          # A solution app never holds an EVAL_* setting: the exam's eval mode must be impossible in a deployed app.
+          if grep -q 'EVAL_' params.json || grep -Eq "name: *'EVAL_" platform/solution/t8/main.bicep; then echo "an EVAL_* setting for a solution app: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           az deployment group what-if -g "$T8_RESOURCE_GROUP" --name "t8-$ENV_NAME-$GITHUB_RUN_ID" --template-file platform/solution/t8/main.bicep --parameters @params.json --no-pretty-print --result-format ResourceIdOnly > whatif.json
           jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json | tee -a "$GITHUB_STEP_SUMMARY"
           if jq -e '.changes[] | select(.changeType == "Delete")' whatif.json > /dev/null; then echo "the what-if deletes a resource: refused"; exit 1; fi
@@ -461,4 +482,4 @@ jobs:
 
       - name: Sign out of Azure
         if: always()
-        run: az logout || true
+        run: az logout || true; az account clear || true
