@@ -146,6 +146,19 @@ jobs:
           buildah push localhost/agent:release "oci-archive:$OUT/image.oci.tar"
           imageDigest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$OUT/image.oci.tar")"
           [[ "$imageDigest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "the image has no manifest digest"; exit 1; }
+          # The exam's eval mode is switched on by EVAL_* settings only, so a released image may never carry one.
+          if skopeo inspect --config "oci-archive:$OUT/image.oci.tar" | jq -e '(.config.Env // [])[] | select(startswith("EVAL_"))' > /dev/null; then echo "the image sets an EVAL_* variable: refused"; exit 1; fi
+          # Nor the exam's token folder (/run/vq-eval): no layer of a released image may hold it. Each layer is listed
+          # to a file first, so a layer that cannot be read stops the release (fails closed).
+          layers="$(mktemp -d)"
+          skopeo copy --quiet "oci-archive:$OUT/image.oci.tar" "dir:$layers/image"
+          jq -r '.layers[].digest' "$layers/image/manifest.json" > "$layers/digests"
+          [[ -s "$layers/digests" ]] || { echo "the image lists no layers"; exit 1; }
+          while IFS= read -r d; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "a layer digest is malformed: $d"; exit 1; }
+            tar -tf "$layers/image/${d#sha256:}" > "$layers/list"
+            if grep -Eq '^(\./)?(var/)?run/vq-eval(/|$)' "$layers/list"; then echo "the image holds /run/vq-eval (the exam's token folder): refused"; exit 1; fi
+          done < "$layers/digests"
           echo "IMAGE_DIGEST=$imageDigest" >> "$GITHUB_ENV"
 
       # skills.tar: regular files only, sorted, fixed owner and time, so the same skills give the same bytes. The

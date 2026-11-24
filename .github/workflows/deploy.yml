@@ -422,6 +422,8 @@ jobs:
               approverObjectIds: ($approvers | split(",") | map(select(length > 0))), vnetPrefix: $vnetPrefix,
               chatUserObjectIds: ($chatUsers | split(",") | map(select(length > 0))), dailyTurnsPerPerson: ($dailyTurns | tonumber), dailyUsdPerPerson: $dailyUsd
             } | with_entries(.value = {value: .value}))}' > params.json
+          # A solution app never holds an EVAL_* setting: the exam's eval mode must be impossible in a deployed app.
+          if grep -q 'EVAL_' params.json || grep -Eq "name: *'EVAL_" platform/solution/t8/main.bicep; then echo "an EVAL_* setting for a solution app: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           az deployment group what-if -g "$T8_RESOURCE_GROUP" --name "t8-$ENV_NAME-$GITHUB_RUN_ID" --template-file platform/solution/t8/main.bicep --parameters @params.json --no-pretty-print --result-format ResourceIdOnly > whatif.json
           jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json | tee -a "$GITHUB_STEP_SUMMARY"
           if jq -e '.changes[] | select(.changeType == "Delete")' whatif.json > /dev/null; then echo "the what-if deletes a resource: refused"; exit 1; fi
