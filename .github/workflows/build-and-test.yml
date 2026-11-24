@@ -1,0 +1,162 @@
+# The ai family's reusable PULL REQUEST workflow for T8 (M13 3.3 "CI (no identity): unit tests of tools and MCP
+# servers, agent image build, skill file checks"; 3.3.1 item 2 step 1, Omar T8-H4). LOCAL TEMPLATE: published as
+# .github/workflows/build-and-test.yml in the ai family's platform repository (Veraqor-inc/vq-delivery-workflows-ai)
+# only after review, and called by every T8 solution repository's ci.yml by FULL COMMIT SHA. Its rules are checked by
+# test/t8-ci-workflow.test.ts.
+#
+# What it holds to (the same rules as the web family's templates/ci/build-and-test.yml):
+#  - no identity: permissions {} for the workflow, contents: read for the one job, no id-token, no secrets, no
+#    environment, no registry login and no push. It runs AI-written code, so it gets nothing worth stealing;
+#  - every action pinned by full commit SHA (the tag is only a comment), the same pins as T8's release.yml;
+#  - package hygiene: npm ci --ignore-scripts against the public registry, a committed package-lock.json required;
+#  - the skills are checked as files only (one folder per skill with a SKILL.md, regular files only, size limits, no
+#    secret-looking content) and their hash is computed with the runtime's rule, as release.yml does;
+#  - the agent image is built the SAME way as release.yml (same build context: the agent folder plus the skills
+#    folder as skills/), into an OCI ARCHIVE on the runner, and uploaded as the artifact "agent-image" holding exactly
+#    one file, image.oci.tar. That is what the engine imports by digest into the eval-only registry for the PR exam
+#    (packages/engine/src/evals/image-import.ts: exactly one .tar, an OCI image layout, every blob checked against its
+#    digest; EVAL_ARTIFACT_NAME defaults to "agent-image"). The artifact is NOT attested here (attestation needs
+#    id-token; it happens in release.yml after merge), so the engine re-runs the exam on the attested release digest
+#    before any UAT card (readiness item eval-release-digest);
+#  - the test report (JUnit XML) and ci-report.json (commit, image digest, skills hash: data for the engine, which
+#    re-checks the image digest itself) uploaded as the artifact "test-report", kept 30 days;
+#  - eval suites and thresholds are NOT read from the solution repository (Omar T8-H6): nothing here runs an eval or
+#    holds a model credential, and there is no CI eval fallback (Omar, T8-H verdict);
+#  - 30 minutes at most.
+name: build-and-test
+
+on:
+  workflow_call:
+    inputs:
+      agent-directory:
+        description: Folder of the agent (package.json, package-lock.json, Dockerfile)
+        type: string
+        default: agent
+      skills-directory:
+        description: Folder of the skills (one folder per skill)
+        type: string
+        default: skills
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      AGENT_DIR: ${{ inputs.agent-directory }}
+      SKILLS_DIR: ${{ inputs.skills-directory }}
+      TEST_RESULTS: ${{ github.workspace }}/test-results
+      OUT: ${{ github.workspace }}/ci-out
+    steps:
+      - name: Check out
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          path='^[A-Za-z0-9._/-]{1,150}$'
+          [[ "$AGENT_DIR" =~ $path && "$SKILLS_DIR" =~ $path ]] || { echo "agent-directory and skills-directory must be plain paths"; exit 1; }
+          [[ "$AGENT_DIR" != *..* && "$SKILLS_DIR" != *..* ]] || { echo "no .. in paths"; exit 1; }
+          test -f "$AGENT_DIR/Dockerfile" || { echo "$AGENT_DIR/Dockerfile is required"; exit 1; }
+          test -f "$AGENT_DIR/package.json" || { echo "$AGENT_DIR/package.json is required"; exit 1; }
+          test -f "$AGENT_DIR/package-lock.json" || { echo "$AGENT_DIR/package-lock.json is required"; exit 1; }
+          test -d "$SKILLS_DIR" || { echo "$SKILLS_DIR is missing"; exit 1; }
+          mkdir -p "$TEST_RESULTS" "$OUT"
+
+      # Files only: nothing in a skill is run here. Names found are printed after a prefix, so a file name can never
+      # start a workflow command line.
+      - name: Check the skills (files only) and compute their hash
+        run: |
+          set -euo pipefail
+          bad="$(find "$SKILLS_DIR" -mindepth 1 ! -type f ! -type d | head -n 5)"
+          [[ -z "$bad" ]] || { echo "the skills folder holds something that is not a regular file or folder:"; printf '%s\n' "$bad" | sed 's/^/  found: /'; exit 1; }
+          count=0
+          for d in "$SKILLS_DIR"/*/; do
+            [[ -d "$d" ]] || continue
+            count=$((count + 1))
+            name="$(basename "$d")"
+            [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "skill folder names are lower-case words and hyphens:"; printf '%s\n' "$name" | sed 's/^/  found: /'; exit 1; }
+            test -s "$d/SKILL.md" || { echo "every skill needs a SKILL.md:"; printf '%s\n' "$name" | sed 's/^/  missing in: /'; exit 1; }
+          done
+          [[ "$count" -ge 1 ]] || { echo "the skills folder holds no skill"; exit 1; }
+          big="$(find "$SKILLS_DIR" -type f -size +256k | head -n 5)"
+          [[ -z "$big" ]] || { echo "a skill file is larger than 256 KB:"; printf '%s\n' "$big" | sed 's/^/  found: /'; exit 1; }
+          total="$(find "$SKILLS_DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')"
+          [[ "$total" -le 5242880 ]] || { echo "the skills are larger than 5 MB in total"; exit 1; }
+          # Omar F7: the same families as the template checks (tools/templates/checks.mjs) plus Entra client secrets.
+          secrets='-----BEGIN [A-Z ]*PRIVATE KEY-----|(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AccountKey=[A-Za-z0-9+/=]{20,}|SharedAccessSignature=|[?&]sig=[A-Za-z0-9%+/=]{20,}|sk-ant-[A-Za-z0-9-]{10,}|xox[abpr]-[A-Za-z0-9-]{10,}|[A-Za-z0-9_~.-]{3}8Q~[A-Za-z0-9_~.-]{31,34}|(password|passwd|pwd|client_?secret|api_?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[^[:space:]"'"'"'$<{][^[:space:]"'"'"']{5,}'
+          hits="$(grep -rIlE -e "$secrets" "$SKILLS_DIR" | head -n 5 || true)"
+          [[ -z "$hits" ]] || { echo "a skill file holds something that looks like a secret:"; printf '%s\n' "$hits" | sed 's/^/  found in: /'; exit 1; }
+          # The runtime's rule (agent-runtime skills.ts; engine skillsHashOfTar), the same as release.yml.
+          skillsHash="sha256:$(cd "$SKILLS_DIR" && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
+          echo "SKILLS_HASH=$skillsHash" >> "$GITHUB_ENV"
+          echo "Skills: $count, hash $skillsHash" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Install (lock file, no install scripts), lint, build and test the agent
+        working-directory: ${{ inputs.agent-directory }}
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          npm run lint --if-present
+          npm run build
+          if jq -e '.scripts.test' package.json > /dev/null; then
+            npm test -- --reporter=default --reporter=junit --outputFile="$TEST_RESULTS/agent-junit.xml"
+          else
+            echo "The agent has no test script: add unit tests for its tools (M13 3.3)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The same recipe as release.yml's image step: no registry, no login, no push, no identity. buildah and skopeo
+      # come with the GitHub-hosted ubuntu-24.04 image [verify the versions on the runner].
+      - name: Build the agent image as an OCI archive (no push)
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/image-context"
+          rm -rf "$context" && mkdir -p "$context"
+          cp -R "$AGENT_DIR/." "$context/"
+          rm -rf "$context/skills" && cp -R "$SKILLS_DIR" "$context/skills"
+          # Omar MF3 (partial): the skills that go into the image must still hash to the value checked before the
+          # agent's own code ran. The engine must still compute the hash itself before the PR exam is switched on.
+          inImage="sha256:$(cd "$context/skills" && find . -type f | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r f; do printf '%s\0%s\0' "$f" "$(stat -c %s "$f")"; cat "$f"; done | sha256sum | cut -d' ' -f1)"
+          [[ "$inImage" == "$SKILLS_HASH" ]] || { echo "the skills changed after they were checked: refused"; exit 1; }
+          buildah build --format oci --layers=false --pull=always -f "$context/Dockerfile" -t localhost/agent:pr "$context"
+          buildah push localhost/agent:pr "oci-archive:$OUT/image.oci.tar"
+          imageDigest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$OUT/image.oci.tar")"
+          [[ "$imageDigest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "the image has no manifest digest"; exit 1; }
+          echo "IMAGE_DIGEST=$imageDigest" >> "$GITHUB_ENV"
+
+      # The engine reads this as data only: it re-checks the image digest from the OCI layout itself, and an image
+      # that differs from the digest named here is refused (image-import.ts, expectedImageDigest).
+      - name: Write the CI report
+        run: |
+          set -euo pipefail
+          jq -n --arg commit "$GITHUB_SHA" --arg imageDigest "$IMAGE_DIGEST" --arg skillsHash "$SKILLS_HASH" \
+            --arg archive "sha256:$(sha256sum "$OUT/image.oci.tar" | cut -d' ' -f1)" \
+            '{commit: $commit, imageDigest: $imageDigest, imageArchive: $archive, skillsHash: $skillsHash}' > "$TEST_RESULTS/ci-report.json"
+          echo "Image $IMAGE_DIGEST; skills $SKILLS_HASH (commit $GITHUB_SHA)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the image archive (exactly one file, for the PR exam)
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: agent-image
+          path: ci-out/image.oci.tar
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: test-report
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: warn
