@@ -127,6 +127,11 @@ param dailyUsdPerPerson string = '10'
 @maxValue(24)
 param approvalLifetimeHours int = 24
 
+@description('Executor replicas kept warm (0 or 1). 1 avoids a cold start (image pull) while an approved draft waits to be recorded.')
+@minValue(0)
+@maxValue(1)
+param executorMinReplicas int = 0
+
 @description('Spend caps the solution gateway enforces (USD; strings so decimals pass through).')
 param conversationCapUsd string = '2'
 param monthlyCapUsd string = '100'
@@ -711,6 +716,7 @@ resource approvalDoorApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'AZURE_CLIENT_ID', value: approvalDoorId.properties.clientId }
             { name: 'APPROVALS_AUDIENCE', value: checkedApprovalsAudience }
             { name: 'APPROVAL_URL', value: approvalUrl }
+            { name: 'EXECUTOR_URL', value: executorUrl }
           ])
         }
       ]
@@ -746,13 +752,14 @@ resource executorApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'APPROVAL_URL', value: approvalUrl }
             { name: 'APPROVAL_KEY_ID', value: checkedApprovalKeyId }
             { name: 'APPROVAL_OID', value: approvalId.properties.principalId }
+            { name: 'APPROVAL_DOOR_OID', value: approvalDoorId.properties.principalId }
             { name: 'APP_CONFIG_ENDPOINT', value: appConfig.properties.endpoint }
             { name: 'MAINTENANCE_API_URL', value: maintenanceApiUrl }
             { name: 'MAINTENANCE_API_SCOPE', value: maintenanceApiScope }
           ])
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 1 }
+      scale: { minReplicas: executorMinReplicas, maxReplicas: 1 }
     }
   }
 }
