@@ -20,7 +20,8 @@
 //     other deploy passes the key's versioned ID (approvalKeyId) and never touches the vault's data plane;
 //   - App Configuration (key sign-in off) holding the run switch `agent:enabled` (created by the owner at
 //     landing; a missing flag counts as OFF, so the agent stays off until the owner sets it to exactly "true");
-//   - Storage (shared keys off, blob soft delete and versioning) for the gateway's spend counters;
+//   - Storage (shared keys off, blob soft delete and versioning) for the gateway's spend counters and the approval
+//     service's durable records (`approvals` container: drafts, approvals, single-use numbers, execution ledger);
 //   - T8-K only (enableKnowledge): Azure AI Search, key sign-in off;
 //   - Log Analytics (key sign-in off, daily cap) and Application Insights (local auth off); every app logs there
 //     through Azure Monitor (no shared key);
@@ -84,7 +85,7 @@ param gatewayAudience string
 @description('The skills hash of the release being deployed (sha256:<64 hex>). The image is the ONLY source of skills (Omar B5): the agent refuses to start unless the skills inside its image hash to exactly this value. The agent loads EVERY skill in its image, and its tools follow those skills (Omar M1, option a): there is no deploy-time skill choice, so the exam sees exactly what ships.')
 param skillsHash string
 
-@description('The Claude deployment: name, model, version, sku (DataZoneStandard), capacity (30 or less: Omar M19-3, VQ Data Zone quota).')
+@description('The Claude deployment: name, model, version, sku (only DataZoneStandard is accepted, Omar D9), capacity (30 or less: Omar M19-3, VQ Data Zone quota).')
 param model object
 @description('Provider data Foundry needs for Claude deployments (organisation, country, industry).')
 param claudeProviderData object
@@ -172,6 +173,10 @@ var checkedSkillsHash = startsWith(skillsHash, 'sha256:') && length(skillsHash) 
 // eval deployment (80 total, eval 50), so one solution environment takes at most 30. More needs a quota request first.
 var maxModelCapacity = 30
 var checkedModelCapacity = int(model.capacity) >= 1 && int(model.capacity) <= maxModelCapacity ? int(model.capacity) : json('model.capacity must be 1 to ${maxModelCapacity} (VQ quota, Omar M19-3): ${model.capacity}')
+// Omar D9: prompts stay in the US data zone. Only the Data Zone SKU is allowed for the Claude deployment; any other
+// value (for example a global SKU from the T8_MODEL variable) stops the deploy here, before anything is created.
+var allowedModelSkus = ['DataZoneStandard']
+var checkedModelSku = contains(allowedModelSkus, string(model.sku)) ? string(model.sku) : json('model.sku must be DataZoneStandard (Omar D9: prompts stay in the data zone): ${model.sku}')
 
 // ---------- Approvals (Omar A1): an approver list in uat and prod, and an approvals audience of its own ----------
 var checkedApprovers = isPrivateTier && empty(approverObjectIds) ? json('${environmentName} needs an approver list (approverObjectIds): an empty list lets anyone in the tenant approve') : approverObjectIds
@@ -346,7 +351,7 @@ resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
 resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-10-01-preview' = {
   parent: foundry
   name: model.name
-  sku: { name: model.sku, capacity: checkedModelCapacity }
+  sku: { name: checkedModelSku, capacity: checkedModelCapacity }
   properties: {
     model: { format: 'Anthropic', name: model.model, version: model.version }
     #disable-next-line BCP037
@@ -437,6 +442,15 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
 resource spendContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobService
   name: 'spend'
+  properties: { publicAccess: 'None' }
+}
+
+// Omar's before-UAT list (A4): the approval service's records survive a restart (drafts, signed approvals, single-use
+// numbers, the execution ledger). Only the approval identity may write here (grants.bicep); every change is an ETag
+// compare-and-swap, and versioning and soft delete keep each earlier state.
+resource approvalsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'approvals'
   properties: { publicAccess: 'None' }
 }
 
@@ -543,6 +557,7 @@ var approvalUrl = 'https://${approvalFqdn}'
 var executorUrl = 'https://${executorFqdn}'
 var searchEndpoint = 'https://srch-${base}-${uniq}.search.windows.net'
 var spendStoreUrl = 'https://${storage.name}.blob.${environment().suffixes.storage}/spend'
+var approvalStoreUrl = 'https://${storage.name}.blob.${environment().suffixes.storage}/approvals'
 var foundryUrl = 'https://${foundry.properties.customSubDomainName}.services.ai.azure.com/anthropic'
 var commonEnv = [
   { name: 'TENANT_ID', value: tenant().tenantId }
@@ -667,6 +682,9 @@ resource approvalApp 'Microsoft.App/containerApps@2025-07-01' = {
             { name: 'AZURE_CLIENT_ID', value: approvalId.properties.clientId }
             { name: 'APPROVAL_KEY_ID', value: checkedApprovalKeyId }
             { name: 'APPROVAL_LIFETIME_HOURS', value: string(approvalLifetimeHours) }
+            { name: 'APPROVAL_STORE_URL', value: approvalStoreUrl }
+            // Omar MF-2b: the approval service reads the run switch's last change (read-only, grants.bicep).
+            { name: 'APP_CONFIG_ENDPOINT', value: appConfig.properties.endpoint }
             { name: 'ENVIRONMENT', value: environmentName }
             { name: 'APPROVALS_AUDIENCE', value: checkedApprovalsAudience }
             { name: 'APPROVER_OIDS', value: checkedApproverList }
@@ -678,7 +696,8 @@ resource approvalApp 'Microsoft.App/containerApps@2025-07-01' = {
           ])
         }
       ]
-      // One replica: the single-use numbers live in this app (a shared store comes with production scale-out).
+      // One replica. Its records are in the `approvals` container (ETag compare-and-swap), so a restart or a revision
+      // switch loses nothing and a single-use number is still consumed once.
       scale: { minReplicas: 1, maxReplicas: 1 }
     }
   }
