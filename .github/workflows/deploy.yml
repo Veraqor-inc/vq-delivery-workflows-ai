@@ -99,34 +99,12 @@ jobs:
       RELEASE_ID: ${{ inputs.release-id }}
       DISPATCH_ID: ${{ inputs.dispatch-id }}
       ROLLBACK: ${{ inputs.rollback }}
-      # This environment's identifiers (GitHub environment VARIABLES set by the environment owner; nothing secret).
-      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      T8_RESOURCE_GROUP: ${{ vars.T8_RESOURCE_GROUP }}
-      T8_SOLUTION: ${{ vars.T8_SOLUTION }}
-      T8_LOCATION: ${{ vars.T8_LOCATION }}
-      T8_IDENTITY_RESOURCE_GROUP: ${{ vars.T8_IDENTITY_RESOURCE_GROUP }}
-      T8_REGISTRY_SERVER: ${{ vars.T8_REGISTRY_SERVER }}
-      T8_GATEWAY_IMAGE: ${{ vars.T8_GATEWAY_IMAGE }}
-      T8_AGENT_AUDIENCE: ${{ vars.T8_AGENT_AUDIENCE }}
-      T8_SERVICE_AUDIENCE: ${{ vars.T8_SERVICE_AUDIENCE }}
-      T8_GATEWAY_AUDIENCE: ${{ vars.T8_GATEWAY_AUDIENCE }}
-      T8_MODEL: ${{ vars.T8_MODEL }}
-      T8_CLAUDE_PROVIDER: ${{ vars.T8_CLAUDE_PROVIDER }}
-      T8_MAINTENANCE_API_URL: ${{ vars.T8_MAINTENANCE_API_URL }}
-      T8_MAINTENANCE_API_SCOPE: ${{ vars.T8_MAINTENANCE_API_SCOPE }}
-      T8_ENABLE_KNOWLEDGE: ${{ vars.T8_ENABLE_KNOWLEDGE }}
-      T8_ENABLE_TEAMS: ${{ vars.T8_ENABLE_TEAMS }}
-      T8_APPROVALS_AUDIENCE: ${{ vars.T8_APPROVALS_AUDIENCE }}
-      # dev and qa only. uat and prod take the approver list from the engine gate's answer (Omar A1(c), B1).
-      T8_APPROVER_OIDS: ${{ vars.T8_APPROVER_OIDS }}
-      T8_VNET_PREFIX: ${{ vars.T8_VNET_PREFIX }}
-      # The advisor's chat users and per-person daily limits (Omar M1, ruling 3.1); main.bicep checks them again.
-      T8_CHAT_USER_OIDS: ${{ vars.T8_CHAT_USER_OIDS }}
-      T8_DAILY_TURNS_PER_PERSON: ${{ vars.T8_DAILY_TURNS_PER_PERSON }}
-      T8_DAILY_USD_PER_PERSON: ${{ vars.T8_DAILY_USD_PER_PERSON }}
-      # Omar ruling 4a (M13 ready from day one): the deploy client ID and the approval key's VERSIONED ID are NOT GitHub
-      # variables. The step "Deploy values from the engine" asks the release gate for them with this job's OIDC token.
+      # Omar ruling 4a and D-4 (R0 4c): NO GitHub variable. The deploy client ID, the approval key's VERSIONED ID and this
+      # environment's settings (AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID and every T8_* value the steps read) come from the
+      # engine's record of this project: the step "Deploy values from the engine" asks the release gate with this job's
+      # OIDC token, checks each value and writes it to the job's environment (GITHUB_ENV) under the name it had when it
+      # was a variable, so every later step, Step A included, reads it as before. No platform identity needs Variables or
+      # Environments write. Nothing here is secret.
       # This workflow never creates the key and never opens the vault: it never passes createApprovalKey.
     steps:
       - name: Check inputs (main only; who may start which environment; the platform's fixed endpoints)
@@ -145,16 +123,9 @@ jobs:
           for a in "$RELEASE_GATE_AUDIENCE" "$RELEASE_STORE_AUDIENCE" "$RELEASE_VERIFIER_AUDIENCE"; do
             [[ "${a,,}" != *azureadtokenexchange* ]] || { echo "an Azure token-exchange audience is never a gate, store or verifier audience"; exit 1; }
           done
-          [[ "$T8_SOLUTION" =~ ^[a-z0-9]{3,12}$ ]] || { echo "T8_SOLUTION is not set"; exit 1; }
-          [[ "$T8_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ && "$T8_IDENTITY_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ ]] || { echo "the resource groups are not set"; exit 1; }
-          [[ "$T8_ENABLE_KNOWLEDGE" == "true" || "$T8_ENABLE_KNOWLEDGE" == "false" ]] || { echo "T8_ENABLE_KNOWLEDGE must be true or false"; exit 1; }
-          [[ "$T8_ENABLE_TEAMS" == "true" || "$T8_ENABLE_TEAMS" == "false" ]] || { echo "T8_ENABLE_TEAMS must be true or false"; exit 1; }
-          [[ -z "$T8_DAILY_TURNS_PER_PERSON" || "$T8_DAILY_TURNS_PER_PERSON" =~ ^[0-9]{1,4}$ ]] || { echo "T8_DAILY_TURNS_PER_PERSON must be a whole number"; exit 1; }
-          [[ -z "$T8_DAILY_USD_PER_PERSON" || "$T8_DAILY_USD_PER_PERSON" =~ ^[0-9]{1,3}(\.[0-9]{1,2})?$ ]] || { echo "T8_DAILY_USD_PER_PERSON must be a number of dollars"; exit 1; }
+          # D-4: this environment's settings are checked when the engine supplies them ("Deploy values from the engine").
           https='^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?/[A-Za-z0-9/._-]*$'
           audience='^[A-Za-z0-9:/._-]{3,200}$'
-          oids='^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$'
-          [[ "$T8_APPROVALS_AUDIENCE" =~ $audience && "${T8_APPROVALS_AUDIENCE,,}" != "${T8_AGENT_AUDIENCE,,}" ]] || { echo "T8_APPROVALS_AUDIENCE must be set and differ from the agent's chat audience"; exit 1; }
           # Every environment asks the gate for its deploy values (ruling 4a), so the gate's address is needed everywhere.
           [[ "$RELEASE_GATE_URL" =~ $https && "$RELEASE_GATE_AUDIENCE" =~ $audience ]] || { echo "the platform's gate address and audience are not set"; exit 1; }
           case "$ENV_NAME" in
@@ -163,8 +134,6 @@ jobs:
               [[ "$ROLLBACK" == "false" ]] || { echo "dev and qa roll forward; rollback is for uat and prod"; exit 1; }
               [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "no commit"; exit 1; }
               { echo "MERGE_COMMIT=$GITHUB_SHA"; echo "SIGNER_SHA=$PLATFORM_SHA"; } >> "$GITHUB_ENV"
-              [[ -z "$T8_APPROVER_OIDS" || "$T8_APPROVER_OIDS" =~ $oids ]] || { echo "T8_APPROVER_OIDS must list object IDs, comma-separated"; exit 1; }
-              echo "APPROVER_OIDS=$T8_APPROVER_OIDS" >> "$GITHUB_ENV"
               ;;
             uat|prod)
               [[ "$GITHUB_EVENT_NAME" == "repository_dispatch" ]] || { echo "uat and prod deploy only on the engine's promotion"; exit 1; }
@@ -194,10 +163,12 @@ jobs:
           ref="$(jq -r '.job_workflow_ref // ""' <<<"$claims")"; sha="$(jq -r '.job_workflow_sha // ""' <<<"$claims")"
           [[ "$ref" == "$PLATFORM_REPOSITORY/.github/workflows/deploy.yml@$PLATFORM_SHA" && "$sha" == "$PLATFORM_SHA" ]] || { echo "this job does not run $PLATFORM_REPOSITORY deploy.yml at $PLATFORM_SHA (it runs $ref)"; exit 1; }
 
-      # Omar ruling 4a: the client ID and the approval key's versioned ID come from the engine's record of this project,
-      # for exactly this environment, asked with this job's own OIDC token (the gate's audience, never an Azure
-      # token-exchange one). No GitHub variable holds them, so the Provisioner needs no Variables or Environments write.
-      - name: Deploy values from the engine (client ID and approval key ID, before any Azure sign-in)
+      # Omar ruling 4a and D-4 (R0 4c): the client ID, the approval key's versioned ID and this environment's settings
+      # come from the engine's record of this project, for exactly this environment, asked with this job's own OIDC token
+      # (the gate's audience, never an Azure token-exchange one). No GitHub variable holds them, so no platform identity
+      # needs Variables or Environments write. Every setting is checked here (one line, its own rule, the same rules as
+      # the engine's T8_DEPLOY_SETTINGS) before it is written to GITHUB_ENV, and only these fixed names are written.
+      - name: Deploy values from the engine (client ID, approval key ID and settings, before any Azure sign-in)
         run: |
           set -euo pipefail
           [[ "${RELEASE_GATE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
@@ -210,11 +181,42 @@ jobs:
           reason="$(jq -r '.reason // "no answer"' values.json 2>/dev/null || echo "no answer")"
           clientId="$(jq -r '.azureClientId // ""' values.json 2>/dev/null || true)"
           keyId="$(jq -r '.approvalKeyId // ""' values.json 2>/dev/null || true)"
+          names="AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID T8_RESOURCE_GROUP T8_SOLUTION T8_LOCATION T8_IDENTITY_RESOURCE_GROUP T8_REGISTRY_SERVER T8_GATEWAY_IMAGE T8_AGENT_AUDIENCE T8_SERVICE_AUDIENCE T8_GATEWAY_AUDIENCE T8_APPROVALS_AUDIENCE T8_MODEL T8_CLAUDE_PROVIDER T8_MAINTENANCE_API_URL T8_MAINTENANCE_API_SCOPE T8_ENABLE_KNOWLEDGE T8_ENABLE_TEAMS T8_APPROVER_OIDS T8_VNET_PREFIX T8_CHAT_USER_OIDS T8_DAILY_TURNS_PER_PERSON T8_DAILY_USD_PER_PERSON"
+          declare -A v
+          for n in $names; do v[$n]="$(jq -r --arg n "$n" '.settings[$n] // "" | strings' values.json 2>/dev/null || true)"; done
           rm -f values.json
           [[ "$code" == "200" && "$decision" == "go" ]] || { echo "Deploy values: refused ($code): $reason" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
           [[ "$clientId" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "Deploy values: the client ID is not a GUID: refused"; exit 1; }
           keyid='^https://kv-[a-z0-9]{1,21}[.]vault[.]azure[.]net/keys/approval/[0-9a-f]{32}$'
           [[ "$keyId" =~ $keyid ]] || { echo "Deploy values: the approval key ID is not the key's versioned ID: refused"; exit 1; }
+          # D-4: each setting, one line, its own rule (the engine's T8_DEPLOY_SETTINGS); empty only where marked optional.
+          bad() { echo "Deploy values: $1 is not valid: refused" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          guid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          oids='^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$'
+          image='^[a-z0-9.-]+(:[0-9]{2,5})?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+          apiUrl='^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?(/[A-Za-z0-9._-]+)*$'
+          for n in $names; do [[ ${#v[$n]} -le 2000 && "${v[$n]}" != *[[:cntrl:]]* ]] || bad "$n"; done
+          for n in AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID T8_AGENT_AUDIENCE T8_SERVICE_AUDIENCE T8_GATEWAY_AUDIENCE T8_APPROVALS_AUDIENCE; do [[ "${v[$n]}" =~ $guid ]] || bad "$n"; done
+          [[ "${v[T8_RESOURCE_GROUP]}" =~ ^[A-Za-z0-9._()-]{1,90}$ ]] || bad T8_RESOURCE_GROUP
+          [[ "${v[T8_IDENTITY_RESOURCE_GROUP]}" =~ ^[A-Za-z0-9._()-]{1,90}$ ]] || bad T8_IDENTITY_RESOURCE_GROUP
+          [[ "${v[T8_SOLUTION]}" =~ ^[a-z0-9]{3,12}$ ]] || bad T8_SOLUTION
+          [[ "${v[T8_LOCATION]}" =~ ^[a-z0-9]{2,40}$ ]] || bad T8_LOCATION
+          [[ "${v[T8_REGISTRY_SERVER]}" =~ ^[a-z0-9]{5,50}[.]azurecr[.]io$ ]] || bad T8_REGISTRY_SERVER
+          [[ "${v[T8_GATEWAY_IMAGE]}" =~ $image ]] || bad T8_GATEWAY_IMAGE
+          for n in T8_MODEL T8_CLAUDE_PROVIDER; do jq -e 'type == "object"' <<<"${v[$n]}" > /dev/null 2>&1 || bad "$n"; done
+          [[ ( -z "${v[T8_MAINTENANCE_API_URL]}" && -z "${v[T8_MAINTENANCE_API_SCOPE]}" ) || ( "${v[T8_MAINTENANCE_API_URL]}" =~ $apiUrl && "${v[T8_MAINTENANCE_API_SCOPE]}" =~ ^[A-Za-z0-9:/._-]{3,200}$ ) ]] || bad "T8_MAINTENANCE_API_URL and T8_MAINTENANCE_API_SCOPE"
+          for n in T8_ENABLE_KNOWLEDGE T8_ENABLE_TEAMS; do [[ "${v[$n]}" == "true" || "${v[$n]}" == "false" ]] || bad "$n"; done
+          [[ "${v[T8_VNET_PREFIX]}" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || bad T8_VNET_PREFIX
+          for n in T8_APPROVER_OIDS T8_CHAT_USER_OIDS; do [[ -z "${v[$n]}" || "${v[$n]}" =~ $oids ]] || bad "$n"; done
+          [[ -z "${v[T8_DAILY_TURNS_PER_PERSON]}" || "${v[T8_DAILY_TURNS_PER_PERSON]}" =~ ^[0-9]{1,4}$ ]] || bad T8_DAILY_TURNS_PER_PERSON
+          [[ -z "${v[T8_DAILY_USD_PER_PERSON]}" || "${v[T8_DAILY_USD_PER_PERSON]}" =~ ^[0-9]{1,3}([.][0-9]{1,2})?$ ]] || bad T8_DAILY_USD_PER_PERSON
+          [[ "${v[T8_APPROVALS_AUDIENCE],,}" != "${v[T8_AGENT_AUDIENCE],,}" ]] || bad "T8_APPROVALS_AUDIENCE (it must differ from the agent's chat audience)"
+          # dev and qa: the approver list is this record's; uat and prod: the release gate's go (Omar A1(c), B1), never this.
+          case "$ENV_NAME" in
+            dev|qa) echo "APPROVER_OIDS=${v[T8_APPROVER_OIDS]}" >> "$GITHUB_ENV" ;;
+            *) [[ -z "${v[T8_APPROVER_OIDS]}" ]] || bad "T8_APPROVER_OIDS (uat and prod take the gate's list)" ;;
+          esac
+          for n in $names; do [[ "$n" == "T8_APPROVER_OIDS" ]] || printf '%s=%s\n' "$n" "${v[$n]}" >> "$GITHUB_ENV"; done
           { echo "AZURE_CLIENT_ID=$clientId"; echo "T8_APPROVAL_KEY_ID=$keyId"; } >> "$GITHUB_ENV"
           echo "Deploy values for $ENV_NAME: from the engine's record" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -408,7 +410,7 @@ jobs:
           source "$RUNNER_TEMP/az-oidc-login.sh"
           az_oidc_login
 
-      # Parameters come only from this environment's variables and the verified release; images by digest. The
+      # Parameters come only from the engine's deploy values (D-4) and the verified release; images by digest. The
       # Container Apps are created inside the deployment (never by the Container Apps CLI commands).
       - name: What-if and deploy the T8 template (images by digest)
         run: |
@@ -459,7 +461,7 @@ jobs:
       # T8-K: the index definition as code, with an Entra token (the custom search-definitions role on this one service,
       # grants.bicep; Omar B2: no keys, no service write).
       - name: Search index definition as code (T8-K)
-        if: vars.T8_ENABLE_KNOWLEDGE == 'true'
+        if: env.T8_ENABLE_KNOWLEDGE == 'true'
         run: |
           set -euo pipefail
           [[ "$T8_OUT_searchName" =~ ^[a-z0-9-]+$ ]] || { echo "no search service in this environment"; exit 1; }
