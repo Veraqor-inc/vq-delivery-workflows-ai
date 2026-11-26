@@ -3,7 +3,10 @@
 //   - gateway   Cognitive Services User on this environment's Foundry account (the only model caller); Storage Blob
 //               Data Contributor on the `spend` container only (shared spend counters);
 //               App Configuration Data Reader (reads the kill switch);
-//   - approval  a custom "sign only" role on the ONE approval key (keys/sign, keys/read);
+//   - approval  a custom "sign only" role on the ONE approval key (keys/sign, keys/read); Storage Blob Data
+//               Contributor on the `approvals` container only (its durable records: drafts, approvals, single-use
+//               numbers, execution ledger; Omar's before-UAT list, A4). The executor gets no role there.
+//               App Configuration Data Reader (Omar MF-2b: refuses approvals decided before the switch's last change);
 //   - executor  a custom "read the key" role on the approval key (verifies signatures); App Configuration Data
 //               Reader (kill switch). Its WRITE roles on back ends (e.g. Dunewell's T1 API app role) are granted
 //               where those back ends live, never here and never to any other identity;
@@ -94,6 +97,10 @@ resource spendContainer 'Microsoft.Storage/storageAccounts/blobServices/containe
   parent: blobService
   name: 'spend'
 }
+resource approvalsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'approvals'
+}
 resource appi 'Microsoft.Insights/components@2020-02-02' existing = {
   name: appInsightsName
 }
@@ -153,6 +160,14 @@ resource executorSwitch 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: { principalId: executorPrincipalId, principalType: 'ServicePrincipal', roleDefinitionId: roleId(roles.appConfigDataReader) }
 }
 
+// Omar MF-2b: the approval service reads the run switch's last_modified (read-only), so an off-and-on cycle cancels
+// every approval decided before it.
+resource approvalSwitch 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: appConfig
+  name: guid(appConfig.id, approvalPrincipalId, roles.appConfigDataReader)
+  properties: { principalId: approvalPrincipalId, principalType: 'ServicePrincipal', roleDefinitionId: roleId(roles.appConfigDataReader) }
+}
+
 resource ownerSwitch 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: appConfig
   name: guid(appConfig.id, ownerGroupObjectId, roles.appConfigDataOwner)
@@ -206,6 +221,14 @@ resource spendLock 'Microsoft.Authorization/locks@2020-05-01' = {
     level: 'CanNotDelete'
     notes: 'T8: the gateway spend counters and their history live here. Removing this lock is an owner action (deploy-notes).'
   }
+}
+
+// The approval app records each signed approval BEFORE it calls the executor (which may be down at that moment), so
+// it, not the executor, is the writer. One container, one identity; the executor keeps the only back-end write roles.
+resource approvalRecords 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: approvalsContainer
+  name: guid(approvalsContainer.id, approvalPrincipalId, roles.storageBlobDataContributor)
+  properties: { principalId: approvalPrincipalId, principalType: 'ServicePrincipal', roleDefinitionId: roleId(roles.storageBlobDataContributor) }
 }
 
 resource gatewaySpend 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
